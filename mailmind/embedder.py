@@ -3,6 +3,19 @@ from __future__ import annotations
 from typing import Iterable, List, Optional
 
 
+def _select_device() -> str:
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
 class Embedder:
     """Pluggable embedding backend.
 
@@ -10,23 +23,49 @@ class Embedder:
     hash-based embedding (development-only) so the pipeline can run without network.
     """
 
-    def __init__(self, model: str = "google/embeddinggemma-300m", dim: int = 256) -> None:
+    def __init__(self, model: str = "intfloat/multilingual-e5-small", dim: int = 256, backend: str = "auto") -> None:
         self.model_name = model
         self.dim = dim
         self._st = None
+        self._tfm = None
+        self._backend = backend
         try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
+            if backend in ("auto", "st"):
+                from sentence_transformers import SentenceTransformer  # type: ignore
 
-            self._st = SentenceTransformer(model)
-            # Get native dimension if available
-            try:
-                native_dim = self._st.get_sentence_embedding_dimension()
-                if self.dim > native_dim:
-                    self.dim = native_dim
-            except Exception:
-                pass
+                self._st = SentenceTransformer(model)
+                # Get native dimension if available
+                try:
+                    native_dim = self._st.get_sentence_embedding_dimension()
+                    if self.dim > native_dim:
+                        self.dim = native_dim
+                except Exception:
+                    pass
         except Exception:
             self._st = None
+
+        # Transformers backend (for models like EmbeddingGemma)
+        if self._st is None or backend in ("auto", "transformers"):
+            try:
+                import torch  # type: ignore
+                from transformers import AutoModel, AutoTokenizer  # type: ignore
+
+                device = _select_device()
+                tok = AutoTokenizer.from_pretrained(model)
+                mod = AutoModel.from_pretrained(model)
+                mod.eval()
+                if device != "cpu":
+                    mod.to(device)
+                self._tfm = (tok, mod, device)
+                # Derive dim from config if available
+                try:
+                    hidden = getattr(mod.config, "hidden_size", None) or getattr(mod.config, "d_model", None)
+                    if isinstance(hidden, int) and self.dim > hidden:
+                        self.dim = hidden
+                except Exception:
+                    pass
+            except Exception:
+                self._tfm = None
 
     def _normalize(self, vec: List[float]) -> List[float]:
         import math
@@ -47,24 +86,56 @@ class Embedder:
         return out
 
     def encode(self, texts: List[str], batch_size: int = 128) -> List[List[float]]:
-        if self._st is None:
-            return self._hash_embed(texts)
-        # Use ST; slice to dim to emulate MRL truncation when needed
-        vecs = self._st.encode(
-            texts,
-            batch_size=batch_size,
-            normalize_embeddings=True,
-            show_progress_bar=False,
-        )
-        # vecs could be numpy arrays; convert to lists and truncate
-        try:
-            import numpy as np  # type: ignore
+        # Prefer ST when available and selected
+        if self._st is not None and self._backend in ("auto", "st"):
+            vecs = self._st.encode(
+                texts,
+                batch_size=batch_size,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            try:
+                import numpy as np  # type: ignore
 
-            if isinstance(vecs, np.ndarray):
-                vecs = vecs[:, : self.dim]
-                return [row.tolist() for row in vecs]
-        except Exception:
-            pass
-        # Fallback generic slice
-        return [list(v)[: self.dim] for v in vecs]
+                if isinstance(vecs, np.ndarray):
+                    vecs = vecs[:, : self.dim]
+                    return [row.tolist() for row in vecs]
+            except Exception:
+                pass
+            return [list(v)[: self.dim] for v in vecs]
 
+        # Transformers fallback/explicit backend
+        if self._tfm is not None:
+            tok, mod, device = self._tfm
+            import torch  # type: ignore
+
+            all_vecs: List[List[float]] = []
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                enc = tok(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=1024,
+                    return_tensors="pt",
+                )
+                if device != "cpu":
+                    enc = {k: v.to(device) for k, v in enc.items()}  # type: ignore
+                with torch.no_grad():
+                    out = mod(**enc)
+                    last = out.last_hidden_state  # (B, T, H)
+                    mask = enc.get("attention_mask")
+                    mask = mask.unsqueeze(-1).to(last.dtype)  # (B, T, 1)
+                    summed = (last * mask).sum(dim=1)
+                    counts = mask.sum(dim=1).clamp(min=1e-9)
+                    embs = summed / counts
+                    # Truncate dims
+                    if embs.shape[1] > self.dim:
+                        embs = embs[:, : self.dim]
+                    # L2 normalize
+                    embs = torch.nn.functional.normalize(embs, p=2, dim=1)
+                    all_vecs.extend(embs.detach().cpu().tolist())
+            return all_vecs
+
+        # Deterministic development-only fallback
+        return self._hash_embed(texts)

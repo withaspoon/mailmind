@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+from .search import SearchResult
+from .embedder import Embedder
+from .ann import HnswIndex
+
+
+@dataclass
+class HybridConfig:
+    vectors_path: Path
+    model: str = "google/embeddinggemma-300m"
+    dim: int = 256
+    fts_k: int = 50
+    ann_k: int = 100
+    rrf_k: int = 60
+
+
+def _fts_messages(db_path: Path, q: str, k: int) -> List[SearchResult]:
+    import sqlite3
+
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    out: List[SearchResult] = []
+    try:
+        sql = (
+            """
+            SELECT m.account, m.folder, m.message_id AS mid, m.subject, m.from_email, m.to_emails, m.date_ts,
+                   snippet(messages_fts, 5, '[', ']', '…', 8) AS snip,
+                   bm25(messages_fts) AS score
+            FROM messages_fts
+            JOIN messages m ON m.message_id = messages_fts.message_id
+            WHERE messages_fts MATCH ?
+            ORDER BY score LIMIT ?
+            """
+        )
+        for row in con.execute(sql, (q, k)):
+            out.append(
+                SearchResult(
+                    type="message",
+                    score=float(row["score"]),
+                    message_id=row["mid"],
+                    subject=row["subject"] or "",
+                    from_email=row["from_email"] or "",
+                    to_emails=row["to_emails"] or "",
+                    date_ts=int(row["date_ts"]) if row["date_ts"] is not None else 0,
+                    folder=row["folder"] or "",
+                    account=row["account"] or "",
+                    snippet=row["snip"] or "",
+                )
+            )
+    finally:
+        con.close()
+    return out
+
+
+def _ann_chunks(db_path: Path, cfg: HybridConfig, q: str) -> List[Tuple[int, float]]:
+    # Returns list of (chunk_id, distance)
+    emb = Embedder(model=cfg.model, dim=cfg.dim)
+    qvec = emb.encode([q])[0]
+    ann = HnswIndex(dim=cfg.dim, path=cfg.vectors_path)
+    if not ann.available():
+        return []
+    try:
+        ann.load()
+    except Exception:
+        return []
+    labels, dists = ann.search([qvec], k=cfg.ann_k)
+    if not labels:
+        return []
+    labs = labels[0]
+    ds = dists[0]
+    return list(zip(labs, ds))
+
+
+def _fetch_chunk_contexts(db_path: Path, chunk_ids: List[int]) -> Dict[int, Tuple[str, str, str, int, str, str, str]]:
+    # chunk_id -> (message_id, subject, from_email, date_ts, folder, account, text)
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    out: Dict[int, Tuple[str, str, str, int, str, str, str]] = {}
+    try:
+        if not chunk_ids:
+            return out
+        # SQLite limits params; chunk into groups of 999
+        for i in range(0, len(chunk_ids), 900):
+            part = chunk_ids[i : i + 900]
+            qmarks = ",".join(["?"] * len(part))
+            sql = f"""
+                SELECT c.id AS chunk_id, m.message_id AS mid, m.subject, m.from_email, m.date_ts, m.folder, m.account, c.text
+                FROM chunks c
+                JOIN messages m ON m.id = c.message_id
+                WHERE c.id IN ({qmarks})
+            """
+            for row in con.execute(sql, part):
+                out[int(row["chunk_id"])] = (
+                    row["mid"],
+                    row["subject"] or "",
+                    row["from_email"] or "",
+                    int(row["date_ts"]) if row["date_ts"] is not None else 0,
+                    row["folder"] or "",
+                    row["account"] or "",
+                    row["text"] or "",
+                )
+    finally:
+        con.close()
+    return out
+
+
+def hybrid_search(db_path: Path, query: str, cfg: HybridConfig) -> List[SearchResult]:
+    # Get FTS message results and ANN chunk results
+    # Auto-resolve model/dim from DB mapping if available
+    try:
+        con = sqlite3.connect(str(db_path))
+        row = con.execute(
+            "SELECT model, dim, COUNT(*) as n FROM chunk_vectors GROUP BY model, dim ORDER BY n DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+        if row is not None and row[0]:
+            cfg.model = row[0]
+            try:
+                cfg.dim = int(row[1])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    fts = _fts_messages(db_path, query, cfg.fts_k)
+    ann_pairs = _ann_chunks(db_path, cfg, query)
+    chunk_ids = [cid for (cid, _dist) in ann_pairs]
+    chunk_ctx = _fetch_chunk_contexts(db_path, chunk_ids)
+
+    # Build pseudo-results for ANN (mapped to message_id)
+    ann_results: List[SearchResult] = []
+    for (cid, dist) in ann_pairs:
+        ctx = chunk_ctx.get(int(cid))
+        if not ctx:
+            continue
+        mid, subject, from_email, date_ts, folder, account, text = ctx
+        ann_results.append(
+            SearchResult(
+                type="chunk",
+                score=float(dist),  # smaller is better for L2
+                message_id=mid,
+                subject=subject,
+                from_email=from_email,
+                to_emails="",
+                date_ts=date_ts,
+                folder=folder,
+                account=account,
+                snippet=text[:200] + ("…" if len(text) > 200 else ""),
+                chunk_id=int(cid),
+            )
+        )
+
+    # Reciprocal Rank Fusion by message_id
+    def rrf(ranks: Dict[str, int], k: int) -> Dict[str, float]:
+        return {mid: 1.0 / (k + r) for mid, r in ranks.items()}
+
+    def ranks_by_mid(items: List[SearchResult]) -> Dict[str, int]:
+        ranks: Dict[str, int] = {}
+        for idx, it in enumerate(items, 1):
+            if it.message_id not in ranks:
+                ranks[it.message_id] = idx
+        return ranks
+
+    r_fts = ranks_by_mid(fts)
+    r_ann = ranks_by_mid(ann_results)
+    s_fts = rrf(r_fts, cfg.rrf_k)
+    s_ann = rrf(r_ann, cfg.rrf_k)
+
+    # Merge scores
+    merged: Dict[str, float] = {}
+    for mid, s in s_fts.items():
+        merged[mid] = merged.get(mid, 0.0) + s
+    for mid, s in s_ann.items():
+        merged[mid] = merged.get(mid, 0.0) + s
+
+    # Pick representative SearchResult per message_id: prefer FTS, else ANN
+    pick: Dict[str, SearchResult] = {}
+    for it in fts + ann_results:
+        if it.message_id not in pick:
+            pick[it.message_id] = it
+
+    # Rank by merged score descending
+    mids_sorted = sorted(merged.items(), key=lambda kv: kv[1], reverse=True)
+    out: List[SearchResult] = []
+    for mid, _score in mids_sorted:
+        out.append(pick[mid])
+    return out

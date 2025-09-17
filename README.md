@@ -38,11 +38,15 @@ Recommended local tooling (macOS)
 - Ollama (for LLMs): `brew install ollama` then `ollama run llama3.1:8b-instruct-q4_K_M`
 
 Models (local)
-- Embeddings (default): google/embeddinggemma-300m (768d); serve with MRL truncation to 256d by default to cut storage.
-  - Place weights in `models/embeddinggemma/` or ensure they are available offline via HF cache.
-  - Alternatives: `intfloat/e5-small`, `BAAI/bge-small-en-v1.5`.
+- Embeddings (default): `intfloat/multilingual-e5-small` (384‑dim). Good CPU speed and multilingual.
+  - Alternatives: `intfloat/e5-small-v2` (English), `BAAI/bge-small-en-v1.5`.
+  - If you want to experiment with EmbeddingGemma, pass `--model` explicitly, but note that model names and availability may vary on HF.
 - Reranker (optional): `BAAI/bge-reranker-base` (quantized or ONNX). Skip if you want minimal deps.
 - Generator LLM: for planning/summarization. Suggested: Llama‑3.1‑8B‑Instruct (Q4_K_M) via Ollama, which uses Metal on M‑series.
+
+Environment variables
+- `MAILMIND_LLM_BACKEND` (default: `ollama`) — set to `ollama` or leave unset. If Ollama is not installed, the summarizer falls back to a simple extractive mode.
+- `MAILMIND_LLM_MODEL` (default: `llama3.1:8b-instruct-q4_K_M`) — model tag for Ollama.
 
 Data layout (default; configurable)
 - `data/db.sqlite3` — SQLite metadata DB + FTS virtual tables
@@ -66,6 +70,39 @@ Install (developer preview)
    - `brew install ocrmypdf tesseract poppler`
 4) (Optional) Install Ollama for the generator LLM
    - `brew install ollama && ollama pull llama3.1:8b-instruct-q4_K_M`
+
+Optional: Enable ANN and embeddings (recommended)
+- Ensure Apple developer tools: `xcode-select --install`
+- Upgrade build tools in your venv:
+  - `.venv/bin/python -m pip install -U pip setuptools wheel`
+- Install ANN + embedding packages (optional but recommended):
+  - `.venv/bin/python -m pip install hnswlib sentence-transformers`
+- For Transformers backend (e.g., EmbeddingGemma via HF):
+  - `.venv/bin/python -m pip install transformers torch --upgrade`
+  - On Apple Silicon, PyTorch will use Metal (MPS) automatically when available.
+- Build or update the vector index:
+  - `mailmind embed --dim 256`
+  - You should see `data/vectors/mailmind_hnsw.bin` (and a `.labels.txt`).
+- Use hybrid search:
+  - `mailmind search-hybrid "invoice OR meeting" --limit 10`
+
+Notes:
+- If `hnswlib` is not installed, `embed` still computes embeddings (using a deterministic fallback if `sentence-transformers` isn’t installed) but will not build an ANN index. Hybrid search will gracefully fall back to FTS results.
+- Installing `sentence-transformers` will pull PyTorch and download model weights on first use (cached locally for offline use thereafter).
+
+Re-embed with a different model
+- To switch embedding models, rebuild the mapping and index:
+  - `mailmind embed --rebuild --model intfloat/multilingual-e5-small --dim 384`
+  - Then run hybrid search again.
+
+Use EmbeddingGemma directly in Python (Transformers backend)
+- If you have the model available in your local HF cache or on disk:
+  - `mailmind embed --rebuild --backend transformers --model <hf_id_or_local_path> --dim 256`
+- Examples (model IDs may vary; ensure you have access and have downloaded them):
+  - `mailmind embed --rebuild --backend transformers --model google/embeddinggemma-300m --dim 256`
+- Notes:
+  - The Transformers backend will auto-detect GPU/Metal (MPS) and run there when available.
+  - If the model isn’t found under that name, point `--model` to a local folder where the model is stored.
 
 Configure
 Create a config file `mailmind.yaml` in the repo root or `~/.config/mailmind/config.yaml`:
@@ -144,8 +181,10 @@ CLI (planned commands)
 - `mailmind sync` — run mbsync for configured accounts (optional helper)
 - `mailmind index --incremental` — parse new messages, attachments, OCR if needed, embed, build ANN
 - `mailmind index-mbox --mbox sample.mbox` — index an mbox file (added for development/testing)
-- `mailmind search "board meeting pdf totals since 2000"` — hybrid query with rerank and citations
-- `mailmind summarize --query "board meeting totals since 2000" --export summary.md` — plan + execute tools + summarization
+- `mailmind search "board meeting pdf totals since 2000"` — lexical FTS search
+- `mailmind search-hybrid "board meeting totals since 2000"` — hybrid (FTS ∪ ANN) if vectors available
+- `mailmind summarize --query "board meeting totals since 2000"` — uses local LLM (Ollama) or a deterministic fallback
+- `mailmind process-attachments --langs eng+spa+swe` — extract text from PDFs/images (OCR fallback) and index
 - `mailmind extract --attachments --type pdf --query "board meeting" --out ./exports/` — copy attachment originals and text to out
 - `mailmind whois --query "medical company contacted in Spain"` — NER + filters over Sent mail
 
@@ -186,6 +225,10 @@ Troubleshooting
 - Large DB: reduce embedding dim to 128 (MRL) or raise chunk size.
 - Missing PDFs text: ensure `ocrmypdf` and `tesseract` are installed; confirm language packs.
 - Planner quality: try a larger generator LLM or enable reranker for more precise top‑K.
+- `summarize` requires a local LLM. By default it tries Ollama (`ollama run llama3.1:8b-instruct-q4_K_M`). If Ollama is not available, it falls back to a simple extractive summary.
+- ANN not built: install `hnswlib` in your venv and re-run `mailmind embed --dim 256`.
+- Hybrid model mismatch: `search-hybrid` auto-detects the model/dim used during `embed` from the database. You can override with `--model`/`--dim` if needed, but for best results keep the same model for indexing and querying.
+- OCR not running: install `ocrmypdf`, `tesseract`, and `poppler` (`pdftotext`) via Homebrew; the pipeline first tries native PDF text, then runs OCR only when needed.
 
 Roadmap snapshot (see TODO.md)
 - M0–M3: ingest, attachments, embeddings, hybrid search

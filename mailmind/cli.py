@@ -11,6 +11,9 @@ from .mbox_indexer import index_mbox
 from .search import search as fts_search
 from .embedder import Embedder
 from .ann import HnswIndex
+from .hybrid import HybridConfig, hybrid_search
+from .summarizer import summarize_query
+from .attachments import process_attachments
 
 
 def _add_init(sub: argparse._SubParsersAction) -> None:
@@ -55,12 +58,55 @@ def _add_embed(sub: argparse._SubParsersAction) -> None:
     p = sub.add_parser("embed", help="Embed chunks and build ANN index (optional, local)")
     p.add_argument("--root", type=Path, default=Path("data"), help="Root data directory (default: ./data)")
     p.add_argument("--db", type=Path, default=None, help="SQLite DB path (default: <root>/db.sqlite3)")
-    p.add_argument("--model", type=str, default="google/embeddinggemma-300m", help="Sentence-Transformers model name")
-    p.add_argument("--dim", type=int, default=256, help="Embedding dim to serve (MRL truncation)")
+    p.add_argument("--model", type=str, default="intfloat/multilingual-e5-small", help="Sentence-Transformers model name")
+    p.add_argument("--dim", type=int, default=256, help="Embedding dimension to serve (slice if needed)")
     p.add_argument("--batch", type=int, default=128, help="Embedding batch size")
     p.add_argument("--vectors", type=Path, default=None, help="Path for ANN index file (default: <root>/vectors/mailmind_hnsw.bin)")
     p.add_argument("--limit", type=int, default=0, help="Only embed first N chunks (0 = all)")
+    p.add_argument("--rebuild", action="store_true", help="Rebuild embeddings and ANN from scratch (clears mapping and index file)")
+    p.add_argument("--backend", type=str, default="auto", choices=["auto", "st", "transformers"], help="Embedding backend")
     p.set_defaults(cmd="embed")
+
+
+def _add_search_hybrid(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("search-hybrid", help="Hybrid search (FTS ∪ ANN) if vectors available")
+    p.add_argument("query", type=str)
+    p.add_argument("--root", type=Path, default=Path("data"))
+    p.add_argument("--db", type=Path, default=None)
+    p.add_argument("--model", type=str, default=None, help="Override embedding model used for ANN (auto-detected from DB if omitted)")
+    p.add_argument("--dim", type=int, default=0, help="Override embedding dim (auto-detected from DB if 0)")
+    p.add_argument("--fts-k", type=int, default=50)
+    p.add_argument("--ann-k", type=int, default=100)
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(cmd="search-hybrid")
+
+
+def _add_summarize(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("summarize", help="Summarize answers for a query using local LLM (Ollama) with citations")
+    p.add_argument("query", type=str)
+    p.add_argument("--root", type=Path, default=Path("data"))
+    p.add_argument("--db", type=Path, default=None)
+    p.add_argument("--top", type=int, default=8, help="Top documents to include")
+    p.set_defaults(cmd="summarize")
+
+
+def _add_process_attachments(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "process-attachments",
+        help="Extract text from attachments (PDF/image) with OCR fallback and index into FTS",
+    )
+    p.add_argument("--root", type=Path, default=Path("data"))
+    p.add_argument("--db", type=Path, default=None)
+    p.add_argument("--langs", type=str, default="eng", help="OCR languages (e.g., eng,eng+spa,swe)")
+    p.add_argument(
+        "--min-chars-per-page",
+        type=int,
+        default=120,
+        help="OCR PDFs when extracted text has fewer chars per page than this threshold",
+    )
+    p.add_argument("--limit", type=int, default=0, help="Process at most N attachments (0 = all)")
+    p.add_argument("--reprocess", action="store_true", help="Force re-extraction even if path_text exists")
+    p.set_defaults(cmd="process-attachments")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -72,6 +118,9 @@ def main(argv: list[str] | None = None) -> int:
     _add_index_mbox(sub)
     _add_search(sub)
     _add_embed(sub)
+    _add_search_hybrid(sub)
+    _add_summarize(sub)
+    _add_process_attachments(sub)
     ns = ap.parse_args(argv)
 
     if ns.cmd is None:
@@ -142,6 +191,19 @@ def main(argv: list[str] | None = None) -> int:
 
         con = sqlite3.connect(str(db_path))
         cur = con.cursor()
+        # Rebuild: clear mapping and delete index file(s)
+        if ns.rebuild:
+            cur.execute("DELETE FROM chunk_vectors")
+            con.commit()
+            vectors_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if vectors_path.exists():
+                    vectors_path.unlink()
+                lp = vectors_path.with_suffix(".labels.txt")
+                if lp.exists():
+                    lp.unlink()
+            except Exception:
+                pass
         cur.execute(
             "SELECT id, text FROM chunks WHERE id NOT IN (SELECT chunk_id FROM chunk_vectors) ORDER BY id"
         )
@@ -153,10 +215,11 @@ def main(argv: list[str] | None = None) -> int:
         if not rows:
             print("No new chunks to embed.")
         else:
-            emb = Embedder(model=ns.model, dim=ns.dim)
+            emb = Embedder(model=ns.model, dim=ns.dim, backend=ns.backend)
             vecs = emb.encode(texts, batch_size=ns.batch)
             # Build or extend ANN index
             ann = HnswIndex(dim=ns.dim, path=vectors_path)
+            ann_saved = False
             if ann.available():
                 try:
                     ann.load()
@@ -167,14 +230,54 @@ def main(argv: list[str] | None = None) -> int:
             if ann.available():
                 ann.add(vecs, chunk_ids)
                 ann.save()
+                ann_saved = True
             # Record mapping in DB
             cur.executemany(
                 "INSERT OR IGNORE INTO chunk_vectors (chunk_id, model, dim) VALUES (?, ?, ?)",
                 [(cid, ns.model, int(ns.dim)) for cid in chunk_ids],
             )
             con.commit()
-            print(f"Embedded {len(vecs)} chunks. ANN index saved to {vectors_path}.")
+            if ann_saved:
+                print(f"Embedded {len(vecs)} chunks. ANN index saved to {vectors_path}.")
+            else:
+                print(f"Embedded {len(vecs)} chunks. ANN index not built (install hnswlib).")
         con.close()
+        return 0
+
+    if ns.cmd == "search-hybrid":
+        cfg_h = HybridConfig(
+            vectors_path=(ns.root / "vectors" / "mailmind_hnsw.bin"),
+            model=ns.model or "google/embeddinggemma-300m",
+            dim=ns.dim or 256,
+            fts_k=ns.fts_k,
+            ann_k=ns.ann_k,
+        )
+        results = hybrid_search(db_path=db_path, query=ns.query, cfg=cfg_h)
+        for i, r in enumerate(results[: ns.limit], 1):
+            print(f"{i:>2}. [{r.type}] {r.subject} — {r.from_email} ({r.account}/{r.folder})")
+            print(f"    id={r.message_id}")
+            if r.snippet:
+                print(f"    {r.snippet}")
+        return 0
+
+    if ns.cmd == "summarize":
+        text = summarize_query(db_path=db_path, root=root, query=ns.query, top_k=ns.top)
+        print(text)
+        return 0
+
+    if ns.cmd == "process-attachments":
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "attachments").mkdir(parents=True, exist_ok=True)
+        init_db(db_path)
+        total, processed, chunks = process_attachments(
+            db_path=db_path,
+            attachments_root=root / "attachments",
+            langs=ns.langs,
+            min_chars_per_page=ns.min_chars_per_page,
+            limit=ns.limit,
+            reprocess=ns.reprocess,
+        )
+        print(f"Attachments processed: {processed}/{total}. Chunks added: {chunks}.")
         return 0
 
     ap.print_help()
