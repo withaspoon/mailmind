@@ -49,6 +49,16 @@ Milestone 4.5 — Incremental Indexing & Workers (3–5 days)
 - [ ] Respect quiet hours and on-battery policy; expose concurrency knobs
 - Acceptance: Stage A indexes fresh mail in seconds; workers drain queues without duplicates
 
+Milestone 4.8 — NL Planner & Fuzzy Predicates (3–6 days)
+- [ ] Planner module (local LLM) outputs JSON plan with: semantic_queries[], concept (one short descriptor string), hard_filters{}, top_k
+- [ ] No static vocabulary in code. All concept phrasing is generated per‑query by the LLM; fallback uses only the original query (no word lists).
+- [ ] Field‑aware meta‑chunks: embed a single meta chunk per message (subject, participants, folder, filenames, short body preview) to enable fuzzy matching across fields via vectors.
+- [ ] Multi‑query ANN retrieval (union across query and planner outputs) + lexical FTS fusion; optional reranker.
+- [ ] Constraint‑aware scorer: enforce only structural hard filters (date/attachments/folder/participants) without any language‑dependent logic.
+- [ ] Integrate into `summarize` by default; add `--nl` to `search-hybrid` to use planner.
+- [ ] UX: show recognized constraints and why‑matched evidence using fields and similarity source (no hard-coded keywords).
+- Acceptance: Natural language queries like “doctor in 2024 with attachment summarize results” and “download invoices from AWS and total per year” work end‑to‑end with citations without any language‑specific code.
+
 Milestone 5 — Reranking & Quality (2–3 days)
 - [ ] Optional cross‑encoder reranker (bge‑reranker)
 - [ ] Small eval harness: Recall@K / MRR on saved queries

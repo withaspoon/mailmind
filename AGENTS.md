@@ -15,6 +15,7 @@ System constraints & invariants
 - Hybrid retrieval: lexical (SQLite FTS5) + semantic (local embeddings) with optional reranking.
 - Security: Never log entire email bodies or PII by default. Logs should be concise and redact addresses.
 - Incremental by design. All indexers and workers must be idempotent and handle re-runs safely. Use stable unique keys and content hashes.
+- No static vocabularies. Do not hard-code domain words, language lists, or synonym tables in source. Semantics must come from embeddings and/or the LLM planner at query time. Structural filters (date/folder/attachment) are allowed.
 
 Target platform & performance
 - Primary: macOS 14+ on Apple Silicon (M3/M4). Secondary: Linux x86_64.
@@ -39,8 +40,9 @@ Repo structure (expected)
 - db/ (schema, migrations, FTS setup)
 - workers/ (future: background worker entrypoints and queue handling)
   - vector/ (embeddings interface, hnswlib/faiss/sqlite-vss adapters)
-  - search/ (hybrid retrieval, filters, rerank)
-  - llm/ (planner, summarizer, model backends: ollama/llama.cpp)
+- search/ (hybrid retrieval, filters, rerank)
+- llm/ (planner, summarizer, model backends: ollama/llama.cpp)
+- planner/ (NL → plan with semantic queries and concept descriptor)
   - tools/ (table extraction, NER, aggregation)
   - utils/ (hashing, threading, chunking, time, logging)
 - data/
