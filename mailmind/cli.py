@@ -80,6 +80,7 @@ def _add_search_hybrid(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--fts-k", type=int, default=50)
     p.add_argument("--ann-k", type=int, default=100)
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--nl", action="store_true", help="Use the NL planner for fuzzy, multilingual constraints and expansions")
     p.set_defaults(cmd="search-hybrid")
 
 
@@ -329,7 +330,23 @@ def main(argv: list[str] | None = None) -> int:
             fts_k=ns.fts_k,
             ann_k=ns.ann_k,
         )
-        results = hybrid_search(db_path=db_path, query=ns.query, cfg=cfg_h)
+        if ns.nl:
+            from .hybrid import hybrid_search_nl
+            plan, results = hybrid_search_nl(db_path=db_path, query=ns.query, cfg=cfg_h)
+            print("Recognized constraints:")
+            print(f"  semantic_queries: {', '.join(plan.semantic_queries[:3])}")
+            if plan.concept:
+                print(f"  concept: {plan.concept}")
+            if plan.hard.date_from or plan.hard.date_to:
+                print(f"  date: {plan.hard.date_from or ''}..{plan.hard.date_to or ''}")
+            if plan.hard.has_attachment:
+                print("  has_attachment: true")
+            if plan.hard.folder:
+                print(f"  folder: {plan.hard.folder}")
+            if plan.hard.from_name or plan.hard.from_email:
+                print(f"  from: {plan.hard.from_name or plan.hard.from_email}")
+        else:
+            results = hybrid_search(db_path=db_path, query=ns.query, cfg=cfg_h)
         for i, r in enumerate(results[: ns.limit], 1):
             print(f"{i:>2}. [{r.type}] {r.subject} — {r.from_email} ({r.account}/{r.folder})")
             print(f"    id={r.message_id}")

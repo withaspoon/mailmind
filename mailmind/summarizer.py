@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from .hybrid import HybridConfig, hybrid_search
+from .hybrid import HybridConfig, hybrid_search_nl
 from .llm import LLMConfig, load_llm_from_env
 
 
@@ -16,6 +16,7 @@ class ContextDoc:
     from_email: str
     folder: str
     account: str
+    date_ts: int
     snippet: str
     text: str
 
@@ -51,6 +52,17 @@ def _fetch_full_text_for_message(db_path: Path, message_id: str, char_limit: int
         con.close()
 
 
+def _fmt_date(ts: int) -> str:
+    if not ts:
+        return ""
+    try:
+        from datetime import datetime
+
+        return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
 def build_prompt(query: str, docs: List[ContextDoc]) -> str:
     lines = [
         "You are a local email research assistant. Answer concisely with citations.",
@@ -60,16 +72,18 @@ def build_prompt(query: str, docs: List[ContextDoc]) -> str:
         "Context (each item shows subject, from, folder/account, id, then excerpt):",
     ]
     for i, d in enumerate(docs, 1):
-        lines.append(f"[{i}] {d.subject} — {d.from_email} ({d.account}/{d.folder}) id={d.message_id}")
+        date_s = _fmt_date(d.date_ts)
+        date_part = f" date={date_s}" if date_s else ""
+        lines.append(f"[{i}] {d.subject} — {d.from_email} ({d.account}/{d.folder}){date_part} id={d.message_id}")
         lines.append(d.text)
         lines.append("")
-    lines.append("Instructions: Provide a short answer. When referencing, cite like [1], [2].")
+    lines.append("Instructions: Provide a short answer. When referencing, cite like [1 2024-03-12], [2 2024-05-01] including date if shown.")
     return "\n".join(lines)
 
 
 def summarize_query(db_path: Path, root: Path, query: str, top_k: int = 8) -> str:
     cfg = HybridConfig(vectors_path=root / "vectors" / "mailmind_hnsw.bin")
-    results = hybrid_search(db_path, query, cfg)
+    plan, results = hybrid_search_nl(db_path, query, cfg)
     # Build contexts
     docs: List[ContextDoc] = []
     for r in results[:top_k]:
@@ -83,6 +97,7 @@ def summarize_query(db_path: Path, root: Path, query: str, top_k: int = 8) -> st
                 from_email=r.from_email,
                 folder=r.folder,
                 account=r.account,
+                date_ts=r.date_ts,
                 snippet=r.snippet,
                 text=text,
             )
@@ -92,5 +107,11 @@ def summarize_query(db_path: Path, root: Path, query: str, top_k: int = 8) -> st
 
     prompt = build_prompt(query, docs)
     llm = load_llm_from_env()
-    return llm.generate(prompt)
-
+    summary = llm.generate(prompt)
+    # Append sources with dates for determinism
+    src_lines = ["", "Sources:"]
+    for i, d in enumerate(docs, 1):
+        date_s = _fmt_date(d.date_ts)
+        date_part = f" {date_s}" if date_s else ""
+        src_lines.append(f"- [{i}{date_part}] {d.subject} — {d.from_email} ({d.account}/{d.folder}) id={d.message_id}")
+    return summary + "\n" + "\n".join(src_lines)

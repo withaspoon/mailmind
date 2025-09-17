@@ -9,6 +9,7 @@ from .search import SearchResult
 from .embedder import Embedder
 from .ann import HnswIndex
 from .utils.fts import nl_to_fts_query
+from .planner import plan_query, Plan
 
 
 @dataclass
@@ -193,3 +194,156 @@ def hybrid_search(db_path: Path, query: str, cfg: HybridConfig) -> List[SearchRe
     for mid, _score in mids_sorted:
         out.append(pick[mid])
     return out
+
+
+def _ann_chunks_multi(db_path: Path, cfg: HybridConfig, queries: List[str]) -> List[Tuple[int, float]]:
+    if not queries:
+        return []
+    emb = Embedder(model=cfg.model, dim=cfg.dim)
+    qvecs = emb.encode(queries[:5])
+    ann = HnswIndex(dim=cfg.dim, path=cfg.vectors_path)
+    if not ann.available():
+        return []
+    try:
+        ann.load()
+    except Exception:
+        return []
+    all_pairs: List[Tuple[int, float]] = []
+    for qv in qvecs:
+        labels, dists = ann.search([qv], k=cfg.ann_k)
+        if not labels:
+            continue
+        labs = labels[0]
+        ds = dists[0]
+        all_pairs.extend(zip(labs, ds))
+    best: Dict[int, float] = {}
+    for cid, dist in all_pairs:
+        if cid not in best or dist < best[cid]:
+            best[cid] = dist
+    return list(best.items())
+
+
+def _parse_ts(iso: str) -> int:
+    from datetime import datetime, timezone
+    try:
+        if len(iso) == 4 and iso.isdigit():
+            return int(datetime(int(iso), 1, 1, tzinfo=timezone.utc).timestamp())
+        return int(datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp())
+    except Exception:
+        return 0
+
+
+def hybrid_search_nl(db_path: Path, query: str, cfg: HybridConfig) -> Tuple[Plan, List[SearchResult]]:
+    # Auto-resolve model/dim from DB mapping
+    try:
+        con = sqlite3.connect(str(db_path))
+        row = con.execute(
+            "SELECT model, dim, COUNT(*) as n FROM chunk_vectors GROUP BY model, dim ORDER BY n DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+        if row is not None and row[0]:
+            cfg.model = row[0]
+            try:
+                cfg.dim = int(row[1])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    plan = plan_query(query)
+    qlist: List[str] = []
+    if query:
+        qlist.append(query)
+    if plan.concept:
+        qlist.append(plan.concept)
+    for s in plan.semantic_queries:
+        if s and s not in qlist:
+            qlist.append(s)
+    # Retrieval
+    fts = _fts_messages(db_path, query, plan.fts_k)
+    ann_pairs = _ann_chunks_multi(db_path, cfg, qlist)
+    chunk_ids = [cid for (cid, _dist) in ann_pairs]
+    chunk_ctx = _fetch_chunk_contexts(db_path, chunk_ids)
+    ann_results: List[SearchResult] = []
+    for (cid, dist) in ann_pairs:
+        ctx = chunk_ctx.get(int(cid))
+        if not ctx:
+            continue
+        mid, subject, from_email, date_ts, folder, account, text = ctx
+        ann_results.append(
+            SearchResult(
+                type="chunk",
+                score=float(dist),
+                message_id=mid,
+                subject=subject,
+                from_email=from_email,
+                to_emails="",
+                date_ts=date_ts,
+                folder=folder,
+                account=account,
+                snippet=text[:200] + ("…" if len(text) > 200 else ""),
+                chunk_id=int(cid),
+            )
+        )
+
+    # RRF fusion
+    def ranks_by_mid(items: List[SearchResult]) -> Dict[str, int]:
+        ranks: Dict[str, int] = {}
+        for idx, it in enumerate(items, 1):
+            if it.message_id not in ranks:
+                ranks[it.message_id] = idx
+        return ranks
+
+    def rrf(ranks: Dict[str, int], k: int) -> Dict[str, float]:
+        return {mid: 1.0 / (k + r) for mid, r in ranks.items()}
+
+    r_fts = ranks_by_mid(fts)
+    r_ann = ranks_by_mid(ann_results)
+    merged: Dict[str, float] = {}
+    for mid, s in rrf(r_fts, getattr(plan, "rrf_k", 60)).items():
+        merged[mid] = merged.get(mid, 0.0) + s
+    for mid, s in rrf(r_ann, getattr(plan, "rrf_k", 60)).items():
+        merged[mid] = merged.get(mid, 0.0) + s
+
+    pick: Dict[str, SearchResult] = {}
+    for it in fts + ann_results:
+        if it.message_id not in pick:
+            pick[it.message_id] = it
+    mids_sorted = sorted(merged.items(), key=lambda kv: kv[1], reverse=True)
+    results: List[SearchResult] = [pick[mid] for mid, _ in mids_sorted]
+
+    # Apply structural filters
+    h = plan.hard
+    if h and (h.date_from or h.date_to or h.has_attachment or h.folder or h.from_name or h.from_email):
+        con = sqlite3.connect(str(db_path))
+        con.row_factory = sqlite3.Row
+        try:
+            allowed: Dict[str, bool] = {}
+            mids = [r.message_id for r in results]
+            for i in range(0, len(mids), 900):
+                part = mids[i : i + 900]
+                qmarks = ",".join(["?"] * len(part))
+                sql = f"SELECT message_id, date_ts, from_email, folder, id FROM messages WHERE message_id IN ({qmarks})"
+                for row in con.execute(sql, part):
+                    ok = True
+                    if h.date_from and row["date_ts"]:
+                        ok = ok and int(row["date_ts"]) >= _parse_ts(h.date_from)
+                    if ok and h.date_to and row["date_ts"]:
+                        ok = ok and int(row["date_ts"]) <= _parse_ts(h.date_to)
+                    if ok and h.folder:
+                        ok = ok and (row["folder"] or "").lower().endswith(h.folder.lower())
+                    if ok and (h.from_name or h.from_email):
+                        f = (row["from_email"] or "").lower()
+                        if h.from_email:
+                            ok = ok and h.from_email.lower() in f
+                        if h.from_name and ok:
+                            ok = ok and h.from_name.lower() in f
+                    if ok and h.has_attachment:
+                        cnt = con.execute("SELECT COUNT(*) FROM attachments WHERE message_id=?", (row["id"],)).fetchone()[0]
+                        ok = ok and cnt > 0
+                    allowed[row["message_id"]] = ok
+            results = [r for r in results if allowed.get(r.message_id, True)]
+        finally:
+            con.close()
+
+    return plan, results

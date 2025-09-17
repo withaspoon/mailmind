@@ -167,6 +167,7 @@ def index_mbox(
                     ),
                 )
 
+                attach_names = []
                 for (fname, mime, content) in parsed.attachments:
                     if not content:
                         continue
@@ -179,6 +180,7 @@ def index_mbox(
                         "INSERT OR IGNORE INTO jobs_attachments(attachment_id, status, tries, updated_ts) VALUES ((SELECT last_insert_rowid()), 'pending', 0, ?)",
                         (int(time.time()),),
                     )
+                    attach_names.append(fname or "")
 
                 if parsed.body:
                     for ch in chunk_text(parsed.body, target_size=800):
@@ -192,6 +194,30 @@ def index_mbox(
                             "INSERT OR IGNORE INTO jobs_embeddings(chunk_id, status, tries, updated_ts) VALUES (?, 'pending', 0, ?)",
                             (cid, int(time.time())),
                         )
+
+                # Meta chunk per message
+                meta_parts = [
+                    f"SUBJECT: {parsed.subject}",
+                    f"FROM: {parsed.from_email}",
+                    f"TO: {parsed.to_emails}",
+                    f"CC: {parsed.cc_emails}",
+                    f"FOLDER: {folder}",
+                    f"ATTACHMENTS: {', '.join(x for x in attach_names if x)}",
+                ]
+                if parsed.body:
+                    meta_parts.append("BODY: " + parsed.body[:500])
+                meta_text = "\n".join(meta_parts)
+                if meta_text.strip():
+                    cur.execute(
+                        "INSERT INTO chunks (message_id, attachment_id, kind, text, token_count) VALUES (?, NULL, 'meta', ?, NULL)",
+                        (mid, meta_text),
+                    )
+                    meta_cid = cur.lastrowid
+                    cur.execute("INSERT INTO chunks_fts (chunk_id, text) VALUES (?, ?)", (meta_cid, meta_text))
+                    cur.execute(
+                        "INSERT OR IGNORE INTO jobs_embeddings(chunk_id, status, tries, updated_ts) VALUES (?, 'pending', 0, ?)",
+                        (meta_cid, int(time.time())),
+                    )
 
                 if count % batch_size == 0:
                     con.commit()
