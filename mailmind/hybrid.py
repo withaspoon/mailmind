@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 from .search import SearchResult
-from .embedder import Embedder
+from .embedder import get_embedder
 from .ann import HnswIndex
 from .utils.fts import nl_to_fts_query
 from .planner import plan_query, Plan
@@ -65,7 +65,7 @@ def _fts_messages(db_path: Path, q: str, k: int) -> List[SearchResult]:
 
 def _ann_chunks(db_path: Path, cfg: HybridConfig, q: str) -> List[Tuple[int, float]]:
     # Returns list of (chunk_id, distance)
-    emb = Embedder(model=cfg.model, dim=cfg.dim)
+    emb = get_embedder(model=cfg.model, dim=cfg.dim)
     qvec = emb.encode([q])[0]
     ann = HnswIndex(dim=cfg.dim, path=cfg.vectors_path)
     if not ann.available():
@@ -201,7 +201,7 @@ def hybrid_search(db_path: Path, query: str, cfg: HybridConfig) -> List[SearchRe
 def _ann_chunks_multi(db_path: Path, cfg: HybridConfig, queries: List[str]) -> List[Tuple[int, float]]:
     if not queries:
         return []
-    emb = Embedder(model=cfg.model, dim=cfg.dim)
+    emb = get_embedder(model=cfg.model, dim=cfg.dim)
     qvecs = emb.encode(queries[:5])
     ann = HnswIndex(dim=cfg.dim, path=cfg.vectors_path)
     if not ann.available():

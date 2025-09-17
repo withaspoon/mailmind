@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Dict, Tuple
+import os
 
 
 def _select_device() -> str:
@@ -29,6 +30,11 @@ class Embedder:
         self._st = None
         self._tfm = None
         self._backend = backend
+        # Reduce file descriptor pressure from HF tokenizers when processes fork
+        try:
+            os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+        except Exception:
+            pass
         try:
             if backend in ("auto", "st"):
                 from sentence_transformers import SentenceTransformer  # type: ignore
@@ -51,8 +57,8 @@ class Embedder:
                 from transformers import AutoModel, AutoTokenizer  # type: ignore
 
                 device = _select_device()
-                tok = AutoTokenizer.from_pretrained(model)
-                mod = AutoModel.from_pretrained(model)
+                tok = AutoTokenizer.from_pretrained(model, local_files_only=True)
+                mod = AutoModel.from_pretrained(model, local_files_only=True)
                 mod.eval()
                 if device != "cpu":
                     mod.to(device)
@@ -139,3 +145,16 @@ class Embedder:
 
         # Deterministic development-only fallback
         return self._hash_embed(texts)
+
+
+# Simple global cache to avoid repeatedly loading models (reduces open FDs)
+_EMBEDDER_CACHE: Dict[Tuple[str, int, str], Embedder] = {}
+
+
+def get_embedder(model: str = "intfloat/multilingual-e5-small", dim: int = 256, backend: str = "auto") -> Embedder:
+    key: Tuple[str, int, str] = (model, int(dim), backend)
+    emb = _EMBEDDER_CACHE.get(key)
+    if emb is None:
+        emb = Embedder(model=model, dim=dim, backend=backend)
+        _EMBEDDER_CACHE[key] = emb
+    return emb

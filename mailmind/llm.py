@@ -26,23 +26,26 @@ class OllamaBackend(LLMBackend):
         self.model = model
 
     def generate(self, prompt: str, system: Optional[str] = None, cfg: Optional[LLMConfig] = None) -> str:
-        # Prefer CLI to avoid HTTP dependencies
+        # Prefer CLI to avoid HTTP dependencies; send prompt via stdin for compatibility
         if system:
-            # Many models ignore -s; we can prepend system to the prompt
+            # Many models ignore a separate system input; prepend to prompt deterministically
             prompt = f"[SYSTEM]\n{system}\n\n[USER]\n{prompt}"
-        args = ["ollama", "run", self.model, "-p", prompt]
+        args = ["ollama", "run", self.model]
         try:
             proc = subprocess.run(
                 args,
+                input=prompt.encode("utf-8"),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
             )
         except FileNotFoundError:
-            raise RuntimeError("Ollama CLI not found. Install it or configure a different backend.")
+            # If Ollama CLI is not present, fallback to extractive summary
+            return SimpleExtractiveBackend().generate(prompt)
         out = proc.stdout.decode("utf-8", errors="ignore").strip()
-        if proc.returncode != 0:
-            raise RuntimeError(f"ollama error: {proc.stderr.decode('utf-8', errors='ignore').strip()}")
+        if proc.returncode != 0 or not out:
+            # On any runtime error or empty output, fallback to extractive summary
+            return SimpleExtractiveBackend().generate(prompt)
         return out
 
 

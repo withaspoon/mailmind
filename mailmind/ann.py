@@ -55,6 +55,43 @@ class HnswIndex:
                 for line in f:
                     self._labels.append(int(line.strip()))
 
+    def current_count(self) -> int:
+        if self._index is None:
+            return 0
+        try:
+            return int(self._index.get_current_count())  # type: ignore[attr-defined]
+        except Exception:
+            # Fallback to labels length if available
+            return len(self._labels)
+
+    def max_elements(self) -> int:
+        if self._index is None:
+            return 0
+        try:
+            return int(self._index.get_max_elements())  # type: ignore[attr-defined]
+        except Exception:
+            # Unknown
+            return 0
+
+    def ensure_capacity(self, needed_extra: int) -> None:
+        if self._index is None:
+            # Initialize with a generous capacity if not present
+            self.init(capacity=max(needed_extra * 2, 10000))
+            return
+        try:
+            cur = self.current_count()
+            mx = self.max_elements()
+            if mx and (cur + needed_extra) > mx:
+                target = max(cur + needed_extra, int(mx * 2))
+                try:
+                    self._index.resize_index(target)  # type: ignore[attr-defined]
+                except Exception:
+                    # As a last resort, re-init a fresh index (labels lost). Caller may decide to skip ANN if this fails.
+                    self.init(capacity=target)
+        except Exception:
+            # Silent best-effort
+            pass
+
     def save(self) -> None:
         if self._index is None:
             return
@@ -68,6 +105,8 @@ class HnswIndex:
     def add(self, vectors: List[List[float]], labels: List[int]) -> None:
         if self._index is None:
             self.init(capacity=max(len(labels) * 2, 10000))
+        # Ensure enough room
+        self.ensure_capacity(len(labels))
         self._index.add_items(vectors, labels)  # type: ignore[attr-defined]
         self._labels.extend(labels)
 
@@ -76,4 +115,3 @@ class HnswIndex:
             self.load()
         labels, dists = self._index.knn_query(query_vecs, k=k)  # type: ignore[attr-defined]
         return labels.tolist(), dists.tolist()  # type: ignore[return-value]
-

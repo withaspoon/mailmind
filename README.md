@@ -182,6 +182,7 @@ Apple Mail: either index directly from `~/Library/Mail` (read‑only) or export 
 - `mailmind init --root ./data` — create folders, DB, FTS tables
 - `mailmind index-mbox --mbox sample.mbox --account demo` — index an mbox file
 - `mailmind index-maildir --root ~/Mail/personal-gmail --account personal-gmail` — index a Maildir
+- `mailmind index-applemail --mail ~/Library/Mail --account personal` — index Apple Mail (macOS, .emlx)
 - `mailmind search "query"` — lexical FTS search
 - `mailmind search-hybrid "query"` — hybrid (FTS ∪ ANN)
 - `mailmind search-hybrid "natural language query"` — NL planner is enabled by default; add `--no-nl` to disable. A fast constraints pre‑pass (tiny LLM) infers soft date ranges and hints; hybrid retrieval applies soft time boosts and structural filters.
@@ -190,6 +191,19 @@ Apple Mail: either index directly from `~/Library/Mail` (read‑only) or export 
 - `mailmind embed --model <id> --dim 256` — embed queued chunks and update ANN
 - `mailmind extract-tables --query "board" --out out/rows.csv --metrics revenue,ebit`
 - `mailmind summarize --query "..."` — uses a local LLM (Ollama) when available
+
+### Apple Mail (macOS)
+- One‑shot index:
+  - `mailmind index-applemail --mail ~/Library/Mail --account personal --progress bar`
+- Simple watch (polling loop):
+  - `mailmind watch-applemail --mail ~/Library/Mail --account personal --interval 30`
+- Note: Grant Full Disk Access to your terminal in System Settings to allow read access to `~/Library/Mail`.
+
+Filter to a single folder (e.g., INBOX of one account):
+- Use `--folder-filter` to match a path substring from the Apple Mail tree. Examples:
+  - `mailmind index-applemail --folder-filter INBOX.mbox`
+  - `mailmind index-applemail --mail ~/Library/Mail --folder-filter "V10/ABCD.../INBOX.mbox"`
+  - You can also point `--mail` directly at a subfolder to narrow the scan scope.
 
 ## Performance
 - Keep embedding dim at 256 (MRL truncation) to reduce size/speed costs

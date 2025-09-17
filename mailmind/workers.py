@@ -187,8 +187,20 @@ def worker_embeddings_once(
     embedded = 0
     try:
         if ann_ok:
-            ann.add(vecs, chunk_ids)
-            ann.save()
+            try:
+                # Ensure capacity and add
+                ann.ensure_capacity(len(vecs))
+                ann.add(vecs, chunk_ids)
+            except Exception as e:
+                # Try to grow and retry once
+                try:
+                    ann.ensure_capacity(len(vecs) * 2)
+                    ann.add(vecs, chunk_ids)
+                except Exception:
+                    # Disable ANN for this batch
+                    ann_ok = False
+            if ann_ok:
+                ann.save()
         # Record mapping and mark jobs done
         cur.executemany(
             "INSERT OR IGNORE INTO chunk_vectors (chunk_id, model, dim) VALUES (?, ?, ?)",

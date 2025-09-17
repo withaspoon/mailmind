@@ -17,6 +17,7 @@ from .attachments import process_attachments
 from .workers import worker_attachments_once, worker_embeddings_once
 from .tables import extract_tables_by_query
 from .constraints import extract_constraints
+from .applemail_indexer import index_apple_mail
 
 
 def _add_init(sub: argparse._SubParsersAction) -> None:
@@ -45,6 +46,64 @@ def _add_index_mbox(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--folder", type=str, default=None, help="Folder label (default: mbox/<name>)")
     p.add_argument("--batch", type=int, default=200, help="DB commit batch size (default: 200)")
     p.set_defaults(cmd="index-mbox")
+
+
+def _add_index_applemail(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "index-applemail",
+        help="Index Apple Mail .emlx messages from ~/Library/Mail (macOS) into the local DB",
+    )
+    p.add_argument(
+        "--mail",
+        type=Path,
+        default=Path("~/Library/Mail"),
+        help="Path to Apple Mail root (default: ~/Library/Mail)",
+    )
+    p.add_argument("--root", type=Path, default=Path("data"), help="Data root (default: ./data)")
+    p.add_argument("--db", type=Path, default=None, help="SQLite DB path (default: <root>/db.sqlite3)")
+    p.add_argument("--account", type=str, default="applemail", help="Logical account name label")
+    p.add_argument("--batch", type=int, default=200, help="DB commit batch size (default: 200)")
+    p.add_argument(
+        "--folder-filter",
+        type=str,
+        default=None,
+        help="Case-insensitive substring to restrict indexing to a specific folder path (e.g., 'INBOX.mbox' or 'Archive.mbox')",
+    )
+    p.add_argument(
+        "--rescan-attachments",
+        action="store_true",
+        help="Also scan sidecar attachments for unchanged messages (uses seen_files mapping)",
+    )
+    p.set_defaults(cmd="index-applemail")
+
+
+def _add_watch_applemail(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser(
+        "watch-applemail",
+        help="Watch Apple Mail root and index incrementally (polling loop)",
+    )
+    p.add_argument(
+        "--mail",
+        type=Path,
+        default=Path("~/Library/Mail"),
+        help="Path to Apple Mail root (default: ~/Library/Mail)",
+    )
+    p.add_argument("--root", type=Path, default=Path("data"))
+    p.add_argument("--db", type=Path, default=None)
+    p.add_argument("--account", type=str, default="applemail")
+    p.add_argument("--interval", type=int, default=30, help="Polling interval seconds (default: 30)")
+    p.add_argument(
+        "--folder-filter",
+        type=str,
+        default=None,
+        help="Case-insensitive substring to restrict indexing to a specific folder path during watch",
+    )
+    p.add_argument(
+        "--rescan-attachments",
+        action="store_true",
+        help="Also scan sidecar attachments for unchanged messages in each cycle",
+    )
+    p.set_defaults(cmd="watch-applemail")
 
 
 def _add_search(sub: argparse._SubParsersAction) -> None:
@@ -176,6 +235,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_init(sub)
     _add_index(sub)
     _add_index_mbox(sub)
+    _add_index_applemail(sub)
     _add_search(sub)
     _add_embed(sub)
     _add_search_hybrid(sub)
@@ -235,6 +295,66 @@ def main(argv: list[str] | None = None) -> int:
             progress_mode=ns.progress,
             progress_root=root,
         )
+        return 0
+
+    if ns.cmd == "index-applemail":
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "attachments").mkdir(parents=True, exist_ok=True)
+        init_db(db_path)
+        mail_root = ns.mail.expanduser()
+        # Friendly macOS hint
+        try:
+            import platform
+
+            if platform.system() == "Darwin":
+                print("Note: If you see permission errors, grant Full Disk Access to your terminal for ~/Library/Mail.")
+        except Exception:
+            pass
+        index_apple_mail(
+            mail_root=mail_root,
+            db_path=db_path,
+            attachments_root=root / "attachments",
+            account=ns.account,
+            batch_size=ns.batch,
+            progress_mode=ns.progress,
+            progress_root=root,
+            compute_total=True,
+            folder_filter=ns.folder_filter,
+            rescan_attachments=ns.rescan_attachments,
+        )
+        return 0
+
+    if ns.cmd == "watch-applemail":
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "attachments").mkdir(parents=True, exist_ok=True)
+        init_db(db_path)
+        mail_root = ns.mail.expanduser()
+        try:
+            import platform
+
+            if platform.system() == "Darwin":
+                print("Watching Apple Mail (polling). For best results, grant Full Disk Access.")
+        except Exception:
+            pass
+        try:
+            while True:
+                index_apple_mail(
+                    mail_root=mail_root,
+                    db_path=db_path,
+                    attachments_root=root / "attachments",
+                    account=ns.account,
+                    batch_size=200,
+                    progress_mode=ns.progress,
+                    progress_root=root,
+                    compute_total=False,
+                    folder_filter=ns.folder_filter,
+                    rescan_attachments=ns.rescan_attachments,
+                )
+                import time as _t
+
+                _t.sleep(int(ns.interval))
+        except KeyboardInterrupt:
+            print("Stopped watch-applemail.")
         return 0
 
     if ns.cmd == "search":
