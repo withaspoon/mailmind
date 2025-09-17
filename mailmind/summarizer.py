@@ -81,7 +81,7 @@ def build_prompt(query: str, docs: List[ContextDoc]) -> str:
     return "\n".join(lines)
 
 
-def summarize_query(db_path: Path, root: Path, query: str, top_k: int = 8) -> str:
+def summarize_query(db_path: Path, root: Path, query: str, top_k: int = 8) -> tuple[object, str]:
     cfg = HybridConfig(vectors_path=root / "vectors" / "mailmind_hnsw.bin")
     plan, results = hybrid_search_nl(db_path, query, cfg)
     # Build contexts
@@ -103,7 +103,7 @@ def summarize_query(db_path: Path, root: Path, query: str, top_k: int = 8) -> st
             )
         )
     if not docs:
-        return "No results found."
+        return plan, "No results found."
 
     prompt = build_prompt(query, docs)
     llm = load_llm_from_env()
@@ -114,4 +114,4 @@ def summarize_query(db_path: Path, root: Path, query: str, top_k: int = 8) -> st
         date_s = _fmt_date(d.date_ts)
         date_part = f" {date_s}" if date_s else ""
         src_lines.append(f"- [{i}{date_part}] {d.subject} — {d.from_email} ({d.account}/{d.folder}) id={d.message_id}")
-    return summary + "\n" + "\n".join(src_lines)
+    return plan, summary + "\n" + "\n".join(src_lines)

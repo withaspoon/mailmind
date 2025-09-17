@@ -16,6 +16,7 @@ from .summarizer import summarize_query
 from .attachments import process_attachments
 from .workers import worker_attachments_once, worker_embeddings_once
 from .tables import extract_tables_by_query
+from .constraints import extract_constraints
 
 
 def _add_init(sub: argparse._SubParsersAction) -> None:
@@ -71,7 +72,7 @@ def _add_embed(sub: argparse._SubParsersAction) -> None:
 
 
 def _add_search_hybrid(sub: argparse._SubParsersAction) -> None:
-    p = sub.add_parser("search-hybrid", help="Hybrid search (FTS ∪ ANN) if vectors available")
+    p = sub.add_parser("search-hybrid", help="Hybrid search (FTS ∪ ANN) with NL planner on by default")
     p.add_argument("query", type=str)
     p.add_argument("--root", type=Path, default=Path("data"))
     p.add_argument("--db", type=Path, default=None)
@@ -80,7 +81,7 @@ def _add_search_hybrid(sub: argparse._SubParsersAction) -> None:
     p.add_argument("--fts-k", type=int, default=50)
     p.add_argument("--ann-k", type=int, default=100)
     p.add_argument("--limit", type=int, default=20)
-    p.add_argument("--nl", action="store_true", help="Use the NL planner for fuzzy, multilingual constraints and expansions")
+    p.add_argument("--no-nl", action="store_true", help="Disable the NL planner (use raw hybrid only)")
     p.set_defaults(cmd="search-hybrid")
 
 
@@ -151,6 +152,12 @@ def _add_extract_tables(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(cmd="extract-tables")
 
 
+def _add_constraints(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("constraints", help="Run the fast constraints extractor and print JSON (debug)")
+    p.add_argument("query", type=str)
+    p.set_defaults(cmd="constraints")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser("mailmind", description="Local email indexer and searcher (offline)")
@@ -159,6 +166,11 @@ def main(argv: list[str] | None = None) -> int:
         choices=["auto", "bar", "json", "none"],
         default="auto",
         help="Progress reporting mode (default: auto)",
+    )
+    ap.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print debug details (constraints extractor, fallbacks)",
     )
     sub = ap.add_subparsers(dest="cmd")
     _add_init(sub)
@@ -171,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_process_attachments(sub)
     _add_worker(sub)
     _add_extract_tables(sub)
+    _add_constraints(sub)
     ns = ap.parse_args(argv)
 
     if ns.cmd is None:
@@ -226,6 +239,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if ns.cmd == "search":
         results = fts_search(db_path=db_path, query=ns.query, limit=ns.limit)
+        def _fmt_date(ts: int) -> str:
+            if not ts:
+                return ""
+            try:
+                from datetime import datetime
+                return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+            except Exception:
+                return ""
         if ns.json:
             for r in results:
                 print(r.to_json())
@@ -233,7 +254,11 @@ def main(argv: list[str] | None = None) -> int:
             for i, r in enumerate(results, 1):
                 dt = r.date_ts
                 print(f"{i:>2}. [{r.type}] {r.subject} — {r.from_email} ({r.account}/{r.folder})")
-                print(f"    id={r.message_id} score={r.score:.3f}")
+                ds = _fmt_date(r.date_ts)
+                if ds:
+                    print(f"    id={r.message_id} date={ds} score={r.score:.3f}")
+                else:
+                    print(f"    id={r.message_id} score={r.score:.3f}")
                 if r.snippet:
                     print(f"    {r.snippet}")
         return 0
@@ -330,8 +355,39 @@ def main(argv: list[str] | None = None) -> int:
             fts_k=ns.fts_k,
             ann_k=ns.ann_k,
         )
-        if ns.nl:
+        if not ns.no_nl:
             from .hybrid import hybrid_search_nl
+            if ns.debug:
+                from .constraints import extract_constraints_debug
+                data, meta = extract_constraints_debug(ns.query)
+                print("Fast constraints (debug):")
+                print(f"  backend: {meta.get('backend')}")
+                print(f"  model: {meta.get('model')}")
+                if meta.get('prompt'):
+                    print("  prompt:")
+                    for ln in str(meta.get('prompt')).splitlines():
+                        print(f"    {ln}")
+                if meta.get('schema'):
+                    print("  schema: (JSON schema used with --format)")
+                    print("    …omitted here; run 'mailmind constraints \"<q>\"' to print full JSON.")
+                if 'returncode' in meta:
+                    print(f"  rc: {meta.get('returncode')} stderr: {meta.get('stderr_sample','')[:120]}")
+                if data.get('date_hypotheses'):
+                    print("  date_hypotheses:")
+                    for h in data['date_hypotheses'][:3]:
+                        print(f"    - {h.get('from')}..{h.get('to')} (w={h.get('weight',1.0)})")
+                else:
+                    print("  date_hypotheses: [] (none)")
+                # Also show dateparser fallback
+                try:
+                    from .utils.date_nlp import detect_date_range
+                    df, dt = detect_date_range(ns.query)
+                    if df and dt:
+                        print(f"  dateparser fallback: {df}..{dt}")
+                    else:
+                        print("  dateparser fallback: none")
+                except Exception:
+                    print("  dateparser not available")
             plan, results = hybrid_search_nl(db_path=db_path, query=ns.query, cfg=cfg_h)
             print("Recognized constraints:")
             print(f"  semantic_queries: {', '.join(plan.semantic_queries[:3])}")
@@ -339,6 +395,27 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  concept: {plan.concept}")
             if plan.hard.date_from or plan.hard.date_to:
                 print(f"  date: {plan.hard.date_from or ''}..{plan.hard.date_to or ''}")
+            if plan.temporal_hypotheses:
+                print("  temporal hypotheses:")
+                for h in plan.temporal_hypotheses[:3]:
+                    try:
+                        print(f"    - {h.get('from','?')}..{h.get('to','?')} (w={h.get('weight',1.0)})")
+                    except Exception:
+                        pass
+            if plan.has_attachment_prob:
+                print(f"  has_attachment_prob: {plan.has_attachment_prob:.2f}")
+            if plan.attachment_type_probs:
+                try:
+                    atp_items = ", ".join(f"{k}:{v:.2f}" for k, v in plan.attachment_type_probs.items())
+                    print(f"  attachment_types: {atp_items}")
+                except Exception:
+                    pass
+            if plan.folder_hint:
+                print(f"  folder_hint: {plan.folder_hint}")
+            if plan.from_hint:
+                print(f"  from_hint: {plan.from_hint}")
+            if plan.org_hint:
+                print(f"  org_hint: {plan.org_hint}")
             if plan.hard.has_attachment:
                 print("  has_attachment: true")
             if plan.hard.folder:
@@ -347,15 +424,96 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  from: {plan.hard.from_name or plan.hard.from_email}")
         else:
             results = hybrid_search(db_path=db_path, query=ns.query, cfg=cfg_h)
+        def _fmt_date(ts: int) -> str:
+            if not ts:
+                return ""
+            try:
+                from datetime import datetime
+                return datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+            except Exception:
+                return ""
         for i, r in enumerate(results[: ns.limit], 1):
             print(f"{i:>2}. [{r.type}] {r.subject} — {r.from_email} ({r.account}/{r.folder})")
-            print(f"    id={r.message_id}")
+            ds = _fmt_date(r.date_ts)
+            if ds:
+                print(f"    id={r.message_id} date={ds}")
+            else:
+                print(f"    id={r.message_id}")
             if r.snippet:
                 print(f"    {r.snippet}")
         return 0
 
     if ns.cmd == "summarize":
-        text = summarize_query(db_path=db_path, root=root, query=ns.query, top_k=ns.top)
+        if ns.debug:
+            from .constraints import extract_constraints_debug
+            data, meta = extract_constraints_debug(ns.query)
+            print("Fast constraints (debug):")
+            print(f"  backend: {meta.get('backend')}")
+            print(f"  model: {meta.get('model')}")
+            if meta.get('prompt'):
+                print("  prompt:")
+                for ln in str(meta.get('prompt')).splitlines():
+                    print(f"    {ln}")
+            if meta.get('schema'):
+                print("  schema: (JSON schema used with --format)")
+                print("    …omitted here; run 'mailmind constraints \"<q>\"' to print full JSON.")
+            if 'returncode' in meta:
+                print(f"  rc: {meta.get('returncode')} stderr: {meta.get('stderr_sample','')[:120]}")
+            if data.get('date_hypotheses'):
+                print("  date_hypotheses:")
+                for h in data['date_hypotheses'][:3]:
+                    print(f"    - {h.get('from')}..{h.get('to')} (w={h.get('weight',1.0)})")
+            else:
+                print("  date_hypotheses: [] (none)")
+            try:
+                from .utils.date_nlp import detect_date_range
+                df, dt = detect_date_range(ns.query)
+                if df and dt:
+                    print(f"  dateparser fallback: {df}..{dt}")
+                else:
+                    print("  dateparser fallback: none")
+            except Exception:
+                print("  dateparser not available")
+        plan, text = summarize_query(db_path=db_path, root=root, query=ns.query, top_k=ns.top)
+        # Print recognized constraints like in search-hybrid
+        try:
+            print("Recognized constraints:")
+            print(f"  semantic_queries: {', '.join(getattr(plan, 'semantic_queries', [])[:3])}")
+            concept = getattr(plan, 'concept', None)
+            if concept:
+                print(f"  concept: {concept}")
+            hard = getattr(plan, 'hard', None)
+            if hard and (hard.date_from or hard.date_to):
+                print(f"  date: {hard.date_from or ''}..{hard.date_to or ''}")
+            hyps = getattr(plan, 'temporal_hypotheses', [])
+            if hyps:
+                print("  temporal hypotheses:")
+                for h in hyps[:3]:
+                    try:
+                        print(f"    - {h.get('from','?')}..{h.get('to','?')} (w={h.get('weight',1.0)})")
+                    except Exception:
+                        pass
+            hap = getattr(plan, 'has_attachment_prob', 0.0)
+            if hap:
+                print(f"  has_attachment_prob: {hap:.2f}")
+            atp = getattr(plan, 'attachment_type_probs', {}) or {}
+            if atp:
+                try:
+                    atps = ", ".join(f"{k}:{float(v):.2f}" for k, v in atp.items())
+                    print(f"  attachment_types: {atps}")
+                except Exception:
+                    pass
+            fh = getattr(plan, 'folder_hint', None)
+            if fh:
+                print(f"  folder_hint: {fh}")
+            frh = getattr(plan, 'from_hint', None)
+            if frh:
+                print(f"  from_hint: {frh}")
+            oh = getattr(plan, 'org_hint', None)
+            if oh:
+                print(f"  org_hint: {oh}")
+        except Exception:
+            pass
         print(text)
         return 0
 
@@ -435,6 +593,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Tables: attachments_examined={taken} tables_found={tables} rows_written={rows}")
         if metrics and rows:
             print(f"Aggregated totals written to {ns.out.with_suffix('.agg.csv')}")
+        return 0
+
+    if ns.cmd == "constraints":
+        data = extract_constraints(ns.query)
+        import json as _json
+        print(_json.dumps(data, ensure_ascii=False, indent=2))
         return 0
 
     ap.print_help()

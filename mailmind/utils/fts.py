@@ -4,30 +4,8 @@ import re
 from typing import List
 
 
-_TOKEN_RE = re.compile(r"[A-Za-z0-9_@.-]+", re.UNICODE)
-_STOPWORDS = {
-    # English minimal
-    "a",
-    "an",
-    "the",
-    "and",
-    "or",
-    "is",
-    "are",
-    "to",
-    "of",
-    "in",
-    "on",
-    "for",
-    "with",
-    "it",
-    "this",
-    "that",
-    "there",
-    "s",
-    # Common variants
-    "pdf",
-}
+_TOKEN_RE = re.compile(r"[\w@.\-]+", re.UNICODE)
+_STOPWORDS = set()  # Avoid language-specific stopwords; rely on embeddings + planner
 
 
 def nl_to_fts_query(q: str, min_token_len: int = 2) -> str:
@@ -43,6 +21,5 @@ def nl_to_fts_query(q: str, min_token_len: int = 2) -> str:
     toks = [t for t in toks if len(t) >= min_token_len and t not in _STOPWORDS]
     if not toks:
         return ""
-    # Join with AND; caller can also OR by repeating calls if desired
+    # Join with AND; keeps FTS safe and language-agnostic
     return " AND ".join(toks)
-

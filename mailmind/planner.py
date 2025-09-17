@@ -24,6 +24,14 @@ class Plan:
     semantic_queries: List[str]
     concept: Optional[str]  # one short descriptor string; optional
     hard: HardFilters
+    temporal_hypotheses: List[Dict] = field(default_factory=list)  # [{"from":"YYYY-MM-DD","to":"YYYY-MM-DD","weight":0..1}]
+    temporal_softness: float = 1.0  # softness multiplier for date scoring
+    # Soft hints from fast extractor
+    has_attachment_prob: float = 0.0
+    attachment_type_probs: Dict[str, float] = field(default_factory=dict)
+    folder_hint: Optional[str] = None
+    from_hint: Optional[str] = None
+    org_hint: Optional[str] = None
     fts_k: int = 50
     ann_k: int = 100
     top_k: int = 50
@@ -34,6 +42,13 @@ class Plan:
                 "semantic_queries": self.semantic_queries,
                 "concept": self.concept,
                 "hard": asdict(self.hard),
+                "temporal_hypotheses": self.temporal_hypotheses,
+                "temporal_softness": self.temporal_softness,
+                "has_attachment_prob": self.has_attachment_prob,
+                "attachment_type_probs": self.attachment_type_probs,
+                "folder_hint": self.folder_hint,
+                "from_hint": self.from_hint,
+                "org_hint": self.org_hint,
                 "fts_k": self.fts_k,
                 "ann_k": self.ann_k,
                 "top_k": self.top_k,
@@ -50,6 +65,13 @@ def _fallback_plan(query: str) -> Plan:
         semantic_queries=[q] if q else [],
         concept=None,
         hard=hard,
+        temporal_hypotheses=[],
+        temporal_softness=1.0,
+        has_attachment_prob=0.0,
+        attachment_type_probs={},
+        folder_hint=None,
+        from_hint=None,
+        org_hint=None,
         fts_k=50,
         ann_k=100,
         top_k=50,
@@ -68,6 +90,8 @@ Fields:
 - semantic_queries: array of 1-3 short paraphrases (include the original); can be in any language.
 - concept: one short descriptor sentence capturing the intent (e.g., "email about medical imaging from a professional"), or null.
 - hard: {{date_from, date_to, has_attachment, attachment_types, folder, from_name, from_email, org_hint}} (omit fields if unknown)
+- temporal_hypotheses: array of objects with {{from: ISO date, to: ISO date, weight: 0..1}}; include 1-3 likely interpretations for relative time phrases like "two months ago". Omit if none.
+- temporal_softness: float (0.5..2.0) indicating how softly to apply temporal constraints (higher = softer). Default 1.0.
 - fts_k, ann_k, top_k: integers
 Only output JSON, no comments.
 
@@ -90,6 +114,8 @@ User query: "{query}"
                 from_email=hard.get("from_email"),
                 org_hint=hard.get("org_hint"),
             ),
+            temporal_hypotheses=data.get("temporal_hypotheses", []) or [],
+            temporal_softness=float(data.get("temporal_softness", 1.0)),
             fts_k=int(data.get("fts_k", 50)),
             ann_k=int(data.get("ann_k", 100)),
             top_k=int(data.get("top_k", 50)),

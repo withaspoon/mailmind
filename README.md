@@ -61,6 +61,8 @@ pip install -e .
 - Embeddings (Transformers backend): `pip install transformers torch --upgrade`
 - PDF tables: `pip install pdfplumber`
 - OCR pipeline: install system deps first, then `pip install ocrmypdf`
+- Natural‑language dates (multilingual): `pip install dateparser`
+ - Fast constraint extractor (LLM via Ollama): install Ollama and pull a small model, e.g. `ollama pull gemma3:4b`. Configure model with `MAILMIND_FAST_LLM_MODEL` (default: `gemma3:4b`).
 
 macOS (Homebrew)
 
@@ -182,7 +184,7 @@ Apple Mail: either index directly from `~/Library/Mail` (read‑only) or export 
 - `mailmind index-maildir --root ~/Mail/personal-gmail --account personal-gmail` — index a Maildir
 - `mailmind search "query"` — lexical FTS search
 - `mailmind search-hybrid "query"` — hybrid (FTS ∪ ANN)
-- `mailmind search-hybrid --nl "natural language query"` — use the local NL planner for fuzzy, multilingual constraints/expansions
+- `mailmind search-hybrid "natural language query"` — NL planner is enabled by default; add `--no-nl` to disable. A fast constraints pre‑pass (tiny LLM) infers soft date ranges and hints; hybrid retrieval applies soft time boosts and structural filters.
 - `mailmind process-attachments --langs eng+spa` — extract text and index
 - `mailmind worker attachments|embeddings [--max N]` — drain job queues once
 - `mailmind embed --model <id> --dim 256` — embed queued chunks and update ANN
