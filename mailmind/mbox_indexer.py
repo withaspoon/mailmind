@@ -14,6 +14,8 @@ from .indexer import (
     _parse_date_to_ts,
 )
 from .utils.text import chunk_text
+from .progress import ProgressReporter, ProgressConfig, resolve_progress_mode
+import time
 
 
 def _parsed_from_message(msg: email.message.EmailMessage, account: str, folder: str) -> ParsedMessage:
@@ -62,6 +64,8 @@ def index_mbox(
     account: str = "default",
     folder: str | None = None,
     batch_size: int = 200,
+    progress_mode: str | None = None,
+    progress_root: Path | None = None,
 ) -> None:
     mbox_path = mbox_path.expanduser().resolve()
     if not mbox_path.exists():
@@ -92,6 +96,19 @@ def index_mbox(
     skipped = 0
 
     box = mailbox.mbox(str(mbox_path))
+    try:
+        total = len(box)
+    except Exception:
+        total = None
+    reporter = ProgressReporter(
+        ProgressConfig(
+            mode=resolve_progress_mode(progress_mode),
+            root=progress_root,
+            key=f"index-mbox:{mbox_path.name}",
+            total=total,
+            desc=f"Index {mbox_path.name}",
+        )
+    )
     try:
         for msg in box:
             count += 1
@@ -158,6 +175,10 @@ def index_mbox(
                         "INSERT INTO attachments (message_id, filename, mime, sha256, bytes, path_original) VALUES (?, ?, ?, ?, ?, ?)",
                         (mid, fname, mime, sha, len(content), str(out)),
                     )
+                    cur.execute(
+                        "INSERT OR IGNORE INTO jobs_attachments(attachment_id, status, tries, updated_ts) VALUES ((SELECT last_insert_rowid()), 'pending', 0, ?)",
+                        (int(time.time()),),
+                    )
 
                 if parsed.body:
                     for ch in chunk_text(parsed.body, target_size=800):
@@ -167,6 +188,10 @@ def index_mbox(
                         )
                         cid = cur.lastrowid
                         cur.execute("INSERT INTO chunks_fts (chunk_id, text) VALUES (?, ?)", (cid, ch))
+                        cur.execute(
+                            "INSERT OR IGNORE INTO jobs_embeddings(chunk_id, status, tries, updated_ts) VALUES (?, 'pending', 0, ?)",
+                            (cid, int(time.time())),
+                        )
 
                 if count % batch_size == 0:
                     con.commit()
@@ -174,9 +199,12 @@ def index_mbox(
             except sqlite3.Error:
                 con.rollback()
                 continue
+            finally:
+                reporter.update(1)
     finally:
         box.close()
 
     con.commit()
     con.close()
     print(f"MBOX indexing done. msgs={count} inserted={inserted} skipped_existing={skipped}")
+    reporter.close()

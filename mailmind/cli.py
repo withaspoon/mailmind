@@ -14,6 +14,8 @@ from .ann import HnswIndex
 from .hybrid import HybridConfig, hybrid_search
 from .summarizer import summarize_query
 from .attachments import process_attachments
+from .workers import worker_attachments_once, worker_embeddings_once
+from .tables import extract_tables_by_query
 
 
 def _add_init(sub: argparse._SubParsersAction) -> None:
@@ -109,9 +111,54 @@ def _add_process_attachments(sub: argparse._SubParsersAction) -> None:
     p.set_defaults(cmd="process-attachments")
 
 
+def _add_worker(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("worker", help="Run background workers once (attachments/embeddings)")
+    sub2 = p.add_subparsers(dest="worker_cmd")
+
+    pa = sub2.add_parser("attachments", help="Process pending attachment OCR jobs once")
+    pa.add_argument("--root", type=Path, default=Path("data"))
+    pa.add_argument("--db", type=Path, default=None)
+    pa.add_argument("--langs", type=str, default="eng")
+    pa.add_argument("--min-chars-per-page", type=int, default=120)
+    pa.add_argument("--max", type=int, default=50, help="Max jobs to process in this run")
+    pa.set_defaults(cmd="worker", worker_cmd="attachments")
+
+    pe = sub2.add_parser("embeddings", help="Process pending embedding jobs once")
+    pe.add_argument("--root", type=Path, default=Path("data"))
+    pe.add_argument("--db", type=Path, default=None)
+    pe.add_argument("--model", type=str, default=None, help="Embedding model (defaults to last used in DB)")
+    pe.add_argument("--dim", type=int, default=0, help="Embedding dim (defaults from DB)")
+    pe.add_argument("--backend", type=str, default="auto", choices=["auto", "st", "transformers"])
+    pe.add_argument("--batch", type=int, default=128)
+    pe.add_argument("--max", type=int, default=200)
+    pe.set_defaults(cmd="worker", worker_cmd="embeddings")
+
+
+def _add_extract_tables(sub: argparse._SubParsersAction) -> None:
+    p = sub.add_parser("extract-tables", help="Extract tables from PDF attachments matching a query; optional yearly aggregation")
+    p.add_argument("query", type=str)
+    p.add_argument("--root", type=Path, default=Path("data"))
+    p.add_argument("--db", type=Path, default=None)
+    p.add_argument("--since", type=int, default=None, help="Only include rows from this year and onwards")
+    p.add_argument("--out", type=Path, required=True, help="Output CSV path for raw numeric rows")
+    p.add_argument(
+        "--metrics",
+        type=str,
+        default=None,
+        help="Comma-separated metric name fragments to aggregate (e.g., 'revenue,ebit,total')",
+    )
+    p.set_defaults(cmd="extract-tables")
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     ap = argparse.ArgumentParser("mailmind", description="Local email indexer and searcher (offline)")
+    ap.add_argument(
+        "--progress",
+        choices=["auto", "bar", "json", "none"],
+        default="auto",
+        help="Progress reporting mode (default: auto)",
+    )
     sub = ap.add_subparsers(dest="cmd")
     _add_init(sub)
     _add_index(sub)
@@ -121,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
     _add_search_hybrid(sub)
     _add_summarize(sub)
     _add_process_attachments(sub)
+    _add_worker(sub)
+    _add_extract_tables(sub)
     ns = ap.parse_args(argv)
 
     if ns.cmd is None:
@@ -153,6 +202,8 @@ def main(argv: list[str] | None = None) -> int:
             attachments_root=root / "attachments",
             account=ns.account,
             batch_size=ns.batch,
+            progress_mode=ns.progress,
+            progress_root=root,
         )
         return 0
 
@@ -167,6 +218,8 @@ def main(argv: list[str] | None = None) -> int:
             account=ns.account,
             folder=ns.folder,
             batch_size=ns.batch,
+            progress_mode=ns.progress,
+            progress_root=root,
         )
         return 0
 
@@ -215,8 +268,8 @@ def main(argv: list[str] | None = None) -> int:
         if not rows:
             print("No new chunks to embed.")
         else:
+            from .progress import ProgressReporter, ProgressConfig, resolve_progress_mode
             emb = Embedder(model=ns.model, dim=ns.dim, backend=ns.backend)
-            vecs = emb.encode(texts, batch_size=ns.batch)
             # Build or extend ANN index
             ann = HnswIndex(dim=ns.dim, path=vectors_path)
             ann_saved = False
@@ -224,13 +277,37 @@ def main(argv: list[str] | None = None) -> int:
                 try:
                     ann.load()
                 except Exception:
-                    ann.init(capacity=max(len(vecs) * 2, 10000))
+                    ann.init(capacity=max(len(texts) * 2, 10000))
             else:
                 print("hnswlib not installed; embeddings computed but ANN index unavailable.")
-            if ann.available():
-                ann.add(vecs, chunk_ids)
-                ann.save()
-                ann_saved = True
+            reporter = ProgressReporter(
+                ProgressConfig(
+                    mode=resolve_progress_mode(ns.progress),
+                    root=root,
+                    key="embed",
+                    total=len(texts),
+                    desc="Embed chunks",
+                )
+            )
+            total_embedded = 0
+            for i in range(0, len(texts), ns.batch):
+                batch_texts = texts[i : i + ns.batch]
+                batch_ids = chunk_ids[i : i + ns.batch]
+                batch_vecs = emb.encode(batch_texts, batch_size=ns.batch)
+                total_embedded += len(batch_vecs)
+                if ann.available():
+                    try:
+                        ann.add(batch_vecs, batch_ids)
+                        ann_saved = True
+                    except Exception:
+                        pass
+                reporter.update(len(batch_vecs))
+            if ann_saved:
+                try:
+                    ann.save()
+                except Exception:
+                    pass
+            reporter.close()
             # Record mapping in DB
             cur.executemany(
                 "INSERT OR IGNORE INTO chunk_vectors (chunk_id, model, dim) VALUES (?, ?, ?)",
@@ -238,9 +315,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             con.commit()
             if ann_saved:
-                print(f"Embedded {len(vecs)} chunks. ANN index saved to {vectors_path}.")
+                print(f"Embedded {total_embedded} chunks. ANN index saved to {vectors_path}.")
             else:
-                print(f"Embedded {len(vecs)} chunks. ANN index not built (install hnswlib).")
+                print(f"Embedded {total_embedded} chunks. ANN index not built (install hnswlib).")
         con.close()
         return 0
 
@@ -276,8 +353,71 @@ def main(argv: list[str] | None = None) -> int:
             min_chars_per_page=ns.min_chars_per_page,
             limit=ns.limit,
             reprocess=ns.reprocess,
+            progress_mode=ns.progress,
+            progress_root=root,
         )
         print(f"Attachments processed: {processed}/{total}. Chunks added: {chunks}.")
+        return 0
+
+    if ns.cmd == "worker":
+        if ns.worker_cmd == "attachments":
+            taken, ok, chunks = worker_attachments_once(
+                db_path=db_path,
+                attachments_root=(root / "attachments"),
+                langs=ns.langs,
+                min_chars_per_page=ns.min_chars_per_page,
+                max_jobs=ns.max,
+                progress_mode=ns.progress,
+                progress_root=root,
+            )
+            print(f"Attachment jobs: taken={taken} ok={ok} chunks_added={chunks}")
+            return 0
+        if ns.worker_cmd == "embeddings":
+            # Auto-detect model/dim from DB if not provided
+            model = ns.model
+            dim = ns.dim
+            if not model or not dim:
+                import sqlite3
+
+                con = sqlite3.connect(str(db_path))
+                row = con.execute(
+                    "SELECT model, dim, COUNT(*) as n FROM chunk_vectors GROUP BY model, dim ORDER BY n DESC LIMIT 1"
+                ).fetchone()
+                con.close()
+                if row is not None and row[0]:
+                    model = model or row[0]
+                    dim = dim or int(row[1])
+                else:
+                    model = model or "intfloat/multilingual-e5-small"
+                    dim = dim or 256
+            taken, embedded = worker_embeddings_once(
+                db_path=db_path,
+                vectors_path=(root / "vectors" / "mailmind_hnsw.bin"),
+                model=model,
+                dim=dim,
+                backend=ns.backend,
+                batch_size=ns.batch,
+                max_jobs=ns.max,
+                progress_mode=ns.progress,
+                progress_root=root,
+            )
+            print(f"Embedding jobs: taken={taken} embedded={embedded}")
+            return 0
+
+    if ns.cmd == "extract-tables":
+        metrics = [s.strip() for s in ns.metrics.split(",")] if ns.metrics else None
+        taken, tables, rows = extract_tables_by_query(
+            db_path=db_path,
+            root=root,
+            query=ns.query,
+            out_csv=ns.out,
+            since_year=ns.since,
+            metrics=metrics,
+            progress_mode=ns.progress,
+        )
+        print(f"Tables: attachments_examined={taken} tables_found={tables} rows_written={rows}")
+        if metrics and rows:
+            print(f"Aggregated totals written to {ns.out.with_suffix('.agg.csv')}")
         return 0
 
     ap.print_help()

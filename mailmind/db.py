@@ -51,6 +51,36 @@ CREATE TABLE IF NOT EXISTS chunk_vectors (
   dim INTEGER
 );
 
+-- Incremental indexing support
+CREATE TABLE IF NOT EXISTS seen_files (
+  path TEXT PRIMARY KEY,
+  inode INTEGER,
+  size INTEGER,
+  mtime INTEGER,
+  message_id TEXT,
+  last_seen_ts INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS jobs_attachments (
+  id INTEGER PRIMARY KEY,
+  attachment_id INTEGER UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|processing|done|error
+  last_error TEXT,
+  tries INTEGER NOT NULL DEFAULT 0,
+  updated_ts INTEGER
+);
+CREATE INDEX IF NOT EXISTS jobs_attachments_status_idx ON jobs_attachments(status);
+
+CREATE TABLE IF NOT EXISTS jobs_embeddings (
+  id INTEGER PRIMARY KEY,
+  chunk_id INTEGER UNIQUE REFERENCES chunks(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'pending', -- pending|processing|done|error
+  last_error TEXT,
+  tries INTEGER NOT NULL DEFAULT 0,
+  updated_ts INTEGER
+);
+CREATE INDEX IF NOT EXISTS jobs_embeddings_status_idx ON jobs_embeddings(status);
+
 -- FTS5 virtual tables (contentless; we insert directly)
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   message_id, subject, from_email, to_emails, cc_emails, body,

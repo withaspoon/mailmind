@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 from .search import SearchResult
 from .embedder import Embedder
 from .ann import HnswIndex
+from .utils.fts import nl_to_fts_query
 
 
 @dataclass
@@ -38,7 +39,8 @@ def _fts_messages(db_path: Path, q: str, k: int) -> List[SearchResult]:
             ORDER BY score LIMIT ?
             """
         )
-        for row in con.execute(sql, (q, k)):
+        q_fts = nl_to_fts_query(q)
+        for row in con.execute(sql, (q_fts, k)):
             out.append(
                 SearchResult(
                     type="message",

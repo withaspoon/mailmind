@@ -19,8 +19,23 @@ Architecture
   - Normalize: parse RFC‑822, build threads, extract attachments into content‑addressed store
   - Index: FTS5 for keyword; embeddings + ANN for semantic
   - Store: SQLite DB (metadata/FTS) + ANN index files (hnswlib by default)
-  - Query: NL → plan (JSON) → hybrid search → rerank → tools (tables/NER/aggregation)
-  - Summarize: local LLM produces answers with citations and optional exports
+- Query: NL → plan (JSON) → hybrid search → rerank → tools (tables/NER/aggregation)
+- Summarize: local LLM produces answers with citations and optional exports
+
+Incremental Indexing (20 GB+ mailboxes)
+- Strategy: detect deltas and process in staged pipelines to stay responsive with hundreds of new emails/day.
+  - Message dedupe keys: `Message-ID` if present; fallback to synthetic ID (From|To|Date|Subject|sha256(body)).
+  - Attachment dedupe key: `sha256(content)` across accounts/folders.
+- Stages:
+  - Stage A (foreground, fast): parse headers/body, insert into `messages` + `messages_fts`, register `attachments` metadata. Runs on every sync.
+  - Stage B (background): extract attachment text (PDF → text; OCR fallback); write `attachments.path_text`; chunk into `chunks/chunks_fts`.
+  - Stage C (background): embed new chunks and update ANN (hnswlib) incrementally.
+- Scheduling:
+  - Run Stage A on every mbsync or fs event.
+  - Stage B/C are background workers with small job queues and backpressure; pause during quiet hours or on battery.
+- Idempotency & robustness:
+  - All inserts are safe with `INSERT OR IGNORE` on unique keys. OCR is cached per `sha256` in `attachments/<sha>/text.txt`.
+  - Transactions commit in small batches; partial failures are retried via job tables.
 
 What’s included (docs)
 - AGENTS.md: repo rules/spec for contributors and agents
@@ -54,6 +69,33 @@ Data layout (default; configurable)
 - `data/attachments/<sha256>/original.ext` — content‑addressed attachments
 - `models/` — local model weights/cache (not checked in)
 
+Configuration (incremental + workers)
+- In `mailmind.yaml` (example):
+
+  root: ./data
+  db_path: ./data/db.sqlite3
+  vectors:
+    backend: hnswlib
+    dim: 256
+    path: ./data/vectors/mailmind_hnsw.bin
+  ocr:
+    languages: [eng, swe, spa]
+    min_chars_per_page: 120
+  workers:
+    attachments:
+      concurrency: 2         # max concurrent OCR jobs
+      quiet_hours: ["22:00", "07:00"]
+      on_battery: pause      # pause|run
+    embeddings:
+      batch_size: 256
+      concurrency: 1
+  ingest:
+    accounts:
+      - name: personal-gmail
+        maildir: ~/Mail/personal-gmail
+      - name: proton
+        maildir: ~/Mail/proton
+
 Install (developer preview)
 1) Create and activate a Python 3.11 virtualenv
    - Any shell (no activation):
@@ -70,6 +112,12 @@ Install (developer preview)
    - `brew install ocrmypdf tesseract poppler`
 4) (Optional) Install Ollama for the generator LLM
    - `brew install ollama && ollama pull llama3.1:8b-instruct-q4_K_M`
+
+Progress display and GUI plumbing
+- All long-running commands support `--progress` with modes: `auto` (default), `bar`, `json`, `none`.
+- JSON progress events are written to stderr as single-line objects when `--progress json` or when not running in a TTY.
+- A status file is maintained at `data/state/progress.json` with the last known progress for each task key (e.g., `index-mbox:<name>`, `embed`, `worker-attachments`). This is intended for a future menu bar UI.
+- You can also set `MAILMIND_PROGRESS` env var to override the mode globally (auto|bar|json|none).
 
 Optional: Enable ANN and embeddings (recommended)
 - Ensure Apple developer tools: `xcode-select --install`
@@ -185,6 +233,11 @@ CLI (planned commands)
 - `mailmind search-hybrid "board meeting totals since 2000"` — hybrid (FTS ∪ ANN) if vectors available
 - `mailmind summarize --query "board meeting totals since 2000"` — uses local LLM (Ollama) or a deterministic fallback
 - `mailmind process-attachments --langs eng+spa+swe` — extract text from PDFs/images (OCR fallback) and index
+- `mailmind embed --rebuild --model intfloat/multilingual-e5-small --dim 384` — recompute embeddings and rebuild ANN
+- `mailmind worker attachments --max 50` — process up to 50 pending attachment OCR jobs
+- `mailmind worker embeddings --max 200` — process up to 200 pending embedding jobs
+- `mailmind extract-tables --query "board meeting" --since 2000 --out out/rows.csv --metrics revenue,ebit` — extract numeric cells from tables in PDFs matching the query; aggregations saved to `rows.agg.csv`
+  - Add `--progress bar` to show a live progress bar, or `--progress json` to emit progress events (for GUI integration).
 - `mailmind extract --attachments --type pdf --query "board meeting" --out ./exports/` — copy attachment originals and text to out
 - `mailmind whois --query "medical company contacted in Spain"` — NER + filters over Sent mail
 
@@ -216,6 +269,12 @@ Performance tips (M‑series Mac)
 - Prefer hnswlib vector store for portability; persist the ANN index to `data/vectors`.
 - Keep reranker disabled unless precision really needs it.
 
+Throughput & sizing expectations
+- Stage A (parse + FTS bodies): 3k–10k msgs/min with batch commits (200–1,000), WAL on.
+- Stage B (PDF text): 20–80 pages/sec with pdfplumber/pdftotext; OCR: 0.5–3 pages/sec/core (tesseract/ocrmypdf). Cache per `sha256`.
+- Stage C (embeddings): e5‑small CPU 2k–10k chunks/min; MPS (Metal) improves further. 256‑dim float32 ≈ 1.0 GB per 1M chunks.
+- Vector index (hnswlib): on‑disk size ≈1.2–1.5× vector payload; incremental adds are fast.
+
 Privacy & security
 - All processing is local. No data leaves your machine. Prefer full‑disk encryption.
 - Redact email addresses/domains in logs. Do not include bodies in logs.
@@ -229,6 +288,13 @@ Troubleshooting
 - ANN not built: install `hnswlib` in your venv and re-run `mailmind embed --dim 256`.
 - Hybrid model mismatch: `search-hybrid` auto-detects the model/dim used during `embed` from the database. You can override with `--model`/`--dim` if needed, but for best results keep the same model for indexing and querying.
 - OCR not running: install `ocrmypdf`, `tesseract`, and `poppler` (`pdftotext`) via Homebrew; the pipeline first tries native PDF text, then runs OCR only when needed.
+- Table extraction empty: ensure `pdfplumber` is installed; results depend on table layout. You can also install `camelot` if needed (optional, not used by default).
+
+Operations & scheduling
+- Sync frequency: run `mbsync` every 5–10 minutes, or use FS watchers to trigger Stage A.
+- Background workers: run `process-attachments` and `embed` periodically (launchd/systemd timers) or as long‑running services that drain queues.
+- DB maintenance: `ANALYZE` monthly; `VACUUM` occasionally when idle and disk is tight.
+- Backups: snapshot `data/db.sqlite3`, `data/vectors/*.bin`, and `data/attachments/`.
 
 Roadmap snapshot (see TODO.md)
 - M0–M3: ingest, attachments, embeddings, hybrid search

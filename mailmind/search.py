@@ -50,7 +50,8 @@ def search(db_path: Path, query: str, limit: int = 20) -> List[SearchResult]:
             ORDER BY score LIMIT ?
             """
         )
-        for row in con.execute(q1, (query, limit)):
+        query_fts = nl_to_fts_query(query)
+        for row in con.execute(q1, (query_fts, limit)):
             out.append(
                 SearchResult(
                     type="message",
@@ -80,7 +81,7 @@ def search(db_path: Path, query: str, limit: int = 20) -> List[SearchResult]:
             ORDER BY score LIMIT ?
             """
         )
-        for row in con.execute(q2, (query, limit)):
+        for row in con.execute(q2, (query_fts, limit)):
             out.append(
                 SearchResult(
                     type="chunk",
@@ -102,4 +103,4 @@ def search(db_path: Path, query: str, limit: int = 20) -> List[SearchResult]:
     # Sort combined results by score ascending (bm25 lower is better), then stable
     out.sort(key=lambda r: r.score)
     return out[:limit]
-
+from .utils.fts import nl_to_fts_query

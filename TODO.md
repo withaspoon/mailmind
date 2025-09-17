@@ -41,6 +41,14 @@ Milestone 4 — Planner & Tools (4–6 days)
 - [ ] Entity extraction (spaCy small) for ORG/GPE/DATE/MONEY
 - Acceptance: End‑to‑end example: “board meeting totals since 2000” produces a summary and CSV with citations
 
+Milestone 4.5 — Incremental Indexing & Workers (3–5 days)
+- [ ] Add `seen_files` table to track path/inode/size/mtime/message_id and skip unchanged files
+- [ ] Add job tables: `jobs_attachments` (attachment_id, status, last_error, tries, updated_ts) and `jobs_embeddings` (chunk_id, status, last_error, tries, updated_ts)
+- [ ] Modify indexers to enqueue B/C jobs; Stage A remains synchronous for bodies
+- [ ] Add CLI worker loops: `mailmind worker attachments`, `mailmind worker embeddings`
+- [ ] Respect quiet hours and on-battery policy; expose concurrency knobs
+- Acceptance: Stage A indexes fresh mail in seconds; workers drain queues without duplicates
+
 Milestone 5 — Reranking & Quality (2–3 days)
 - [ ] Optional cross‑encoder reranker (bge‑reranker)
 - [ ] Small eval harness: Recall@K / MRR on saved queries
@@ -76,4 +84,3 @@ Acceptance checklist (MVP)
 - [ ] Searches via hybrid retrieval with reasonable latency (<250 ms for top‑50 on M‑class Mac)
 - [ ] Extracts PDFs (including OCR) and makes them searchable
 - [ ] Answers planner‑style queries with citations (paths + IDs)
-

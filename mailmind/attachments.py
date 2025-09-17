@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Tuple
 
 from .parsing.docs import OCRConfig, extract_attachment_text
 from .utils.text import chunk_text
+from .progress import ProgressReporter, ProgressConfig, resolve_progress_mode
 
 
 def process_attachments(
@@ -15,6 +16,8 @@ def process_attachments(
     min_chars_per_page: int = 120,
     limit: int = 0,
     reprocess: bool = False,
+    progress_mode: str | None = None,
+    progress_root: Path | None = None,
 ) -> Tuple[int, int, int]:
     """Extract text (with OCR if necessary) for attachments and index into FTS.
 
@@ -37,6 +40,15 @@ def process_attachments(
     processed = 0
     chunks_added = 0
 
+    reporter = ProgressReporter(
+        ProgressConfig(
+            mode=resolve_progress_mode(progress_mode),
+            root=progress_root,
+            key="process-attachments",
+            total=len(rows),
+            desc="Attachments",
+        )
+    )
     for aid, mid, fname, mime, sha, p_orig, p_text in rows:
         # Skip if already has text and not reprocessing
         if not reprocess and p_text:
@@ -78,8 +90,9 @@ def process_attachments(
         # Commit periodically
         if (processed + chunks_added) % 100 == 0:
             con.commit()
+        reporter.update(1)
 
     con.commit()
     con.close()
+    reporter.close()
     return (len(rows), processed, chunks_added)
-

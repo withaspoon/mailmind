@@ -14,6 +14,7 @@ System constraints & invariants
 - Single local source of truth. A SQLite database (metadata + FTS) plus a content‑addressed attachments store.
 - Hybrid retrieval: lexical (SQLite FTS5) + semantic (local embeddings) with optional reranking.
 - Security: Never log entire email bodies or PII by default. Logs should be concise and redact addresses.
+- Incremental by design. All indexers and workers must be idempotent and handle re-runs safely. Use stable unique keys and content hashes.
 
 Target platform & performance
 - Primary: macOS 14+ on Apple Silicon (M3/M4). Secondary: Linux x86_64.
@@ -35,7 +36,8 @@ Repo structure (expected)
   - config/ (schema, loaders)
   - ingest/ (maildir/imap/mbox/apple mail adapters)
   - parsing/ (body, HTML clean, attachment text, OCR)
-  - db/ (schema, migrations, FTS setup)
+- db/ (schema, migrations, FTS setup)
+- workers/ (future: background worker entrypoints and queue handling)
   - vector/ (embeddings interface, hnswlib/faiss/sqlite-vss adapters)
   - search/ (hybrid retrieval, filters, rerank)
   - llm/ (planner, summarizer, model backends: ollama/llama.cpp)
@@ -62,6 +64,9 @@ Data model (high‑level)
 - tags(message_id, tag)
 - entities(id, chunk_id, type, value, canonical, score)
 - FTS5 virtual tables for messages/chunks text search
+- (planned) seen_files(path, inode, size, mtime, message_id, last_seen_ts)
+- (planned) jobs_attachments(attachment_id, status, last_error, tries, updated_ts)
+- (planned) jobs_embeddings(chunk_id, status, last_error, tries, updated_ts)
 
 Planner & DSL (must‑have behaviors)
 - LLM produces a JSON plan with: filters (date ranges, participants, has:pdf, tags), search terms (lexical), semantic query, ops (collect_attachments, extract_tables, aggregate, summarize), and top_k. Execution is deterministic and auditable with citations back to message/attachment ids.
@@ -71,6 +76,11 @@ Performance & robustness rules
 - Batch embedding where possible. Normalize embeddings to unit vectors.
 - Keep default embedding dim at 256 via MRL truncation to balance size and quality.
 - Use incremental indexing keyed by file mtime and content hash.
+- Stage pipeline:
+  - Stage A: fast parse + FTS for bodies. Always prioritize fresh mail for immediate searchability.
+  - Stage B: attachment text + OCR (background). Cache OCR per sha256; atomic writes to caches.
+  - Stage C: embeddings + ANN incrementally (background). Respect model/dim stored in DB.
+- Concurrency: small worker pools; keep transactions short and commit frequently.
 
 Security & privacy
 - Run entirely local. Never ship data off‑device. If a future UI is added, bind to localhost only.
@@ -82,6 +92,7 @@ Testing philosophy
 - Unit tests for parsers, chunking, hashing, and DB I/O. Golden‑file tests for email parsers with synthetic fixtures (no real mail). Use `sample.mbox` as a baseline fixture for integration tests.
 - Integration tests should index a small Maildir and the provided `sample.mbox`, then run representative searches end‑to‑end, asserting deterministic results and citations.
 - No network during tests. All tests must be fully offline and reproducible.
+- Incremental tests: simulate new mail arrivals and verify A/B/C stages pick up deltas without duplicate rows; verify OCR and embeddings job queues drain and recover after induced failures.
 
 Dependencies policy
 - Keep core deps minimal and portable. Heavy/optional deps (FAISS, spaCy large pipelines) must be behind optional extras.

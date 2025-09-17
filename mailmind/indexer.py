@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Tuple
 
 from .utils.text import html_to_text, chunk_text
+from .progress import ProgressReporter, ProgressConfig, resolve_progress_mode
+import time
 
 
 @dataclass
@@ -207,6 +209,8 @@ def index_maildir(
     attachments_root: Path,
     account: str = "default",
     batch_size: int = 200,
+    progress_mode: str | None = None,
+    progress_root: Path | None = None,
 ) -> None:
     con = sqlite3.connect(str(db_path))
     con.execute("PRAGMA journal_mode=WAL;")
@@ -217,6 +221,15 @@ def index_maildir(
     inserted = 0
     skipped = 0
 
+    reporter = ProgressReporter(
+        ProgressConfig(
+            mode=resolve_progress_mode(progress_mode),
+            root=progress_root,
+            key=f"index-maildir:{account}",
+            total=None,
+            desc=f"Index {account}",
+        )
+    )
     for folder, _kind, fp in _walk_maildir(maildir):
         count += 1
         parsed = parse_eml(fp, account=account, folder=folder)
@@ -286,6 +299,11 @@ def index_maildir(
                     """,
                     (mid, fname, mime, sha, len(content), str(out)),
                 )
+                # Enqueue attachment job (Stage B)
+                cur.execute(
+                    "INSERT OR IGNORE INTO jobs_attachments(attachment_id, status, tries, updated_ts) VALUES ((SELECT last_insert_rowid()), 'pending', 0, ?)",
+                    (int(time.time()),),
+                )
 
             # Chunk body and insert into chunks + chunks_fts
             if parsed.body:
@@ -299,6 +317,11 @@ def index_maildir(
                         "INSERT INTO chunks_fts (chunk_id, text) VALUES (?, ?)",
                         (cid, ch),
                     )
+                    # Enqueue embedding job (Stage C)
+                    cur.execute(
+                        "INSERT OR IGNORE INTO jobs_embeddings(chunk_id, status, tries, updated_ts) VALUES (?, 'pending', 0, ?)",
+                        (cid, int(time.time())),
+                    )
 
             if count % batch_size == 0:
                 con.commit()
@@ -307,8 +330,11 @@ def index_maildir(
             # Keep indexing despite individual failures
             con.rollback()
             continue
+        finally:
+            reporter.update(1)
 
     con.commit()
     con.close()
 
     print(f"Indexing done. files={count} inserted_messages={inserted} skipped_existing={skipped}")
+    reporter.close()
