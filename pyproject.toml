@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailmind"
+version = "0.1.0"
+description = "Local multi-account email search & summarization CLI (offline)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "Proprietary"}
+authors = [{name = "Mailmind"}]
+dependencies = []
+
+[project.scripts]
+mailmind = "mailmind.cli:main"
+
+[tool.setuptools]
+packages = ["mailmind"]
+
