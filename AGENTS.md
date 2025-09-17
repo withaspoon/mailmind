@@ -77,9 +77,11 @@ Security & privacy
 - Provide config for encrypting DB and attachments at rest (use OS disk encryption by default; defer app‑level encryption unless required).
 
 Testing philosophy
-- Unit tests for parsers, chunking, hashing, and DB I/O. Golden‑file tests for email parsers with synthetic fixtures (no real mail).
-- Integration tests for indexing a tiny Maildir and running a few searches end‑to‑end.
-- No network during tests.
+- Red–green testing as the default workflow: write a failing test first (red), implement minimal code to pass (green), then refactor safely.
+- Aim for high coverage (target ≥85% lines, ≥80% branches) on core modules: parsing, indexing, chunking, DB I/O, and search.
+- Unit tests for parsers, chunking, hashing, and DB I/O. Golden‑file tests for email parsers with synthetic fixtures (no real mail). Use `sample.mbox` as a baseline fixture for integration tests.
+- Integration tests should index a small Maildir and the provided `sample.mbox`, then run representative searches end‑to‑end, asserting deterministic results and citations.
+- No network during tests. All tests must be fully offline and reproducible.
 
 Dependencies policy
 - Keep core deps minimal and portable. Heavy/optional deps (FAISS, spaCy large pipelines) must be behind optional extras.
@@ -99,4 +101,3 @@ Operational checklists
 
 Licensing notes
 - Gemma models are under Google’s Gemma license; local, private use is OK. Do not redistribute weights via this repo.
-

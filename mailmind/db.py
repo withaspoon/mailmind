@@ -44,15 +44,22 @@ CREATE TABLE IF NOT EXISTS chunks (
   token_count INTEGER
 );
 
+-- Mapping of embedded chunks to model/dim; vector data stored externally (e.g., hnswlib file)
+CREATE TABLE IF NOT EXISTS chunk_vectors (
+  chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id) ON DELETE CASCADE,
+  model TEXT,
+  dim INTEGER
+);
+
 -- FTS5 virtual tables (contentless; we insert directly)
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
   message_id, subject, from_email, to_emails, cc_emails, body,
-  tokenize = 'unicode61 remove_diacritics 2 tokenchars "._-@"'
+  tokenize = "unicode61 remove_diacritics 2 tokenchars '._-@'"
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
   chunk_id, text,
-  tokenize = 'unicode61 remove_diacritics 2 tokenchars "._-@"'
+  tokenize = "unicode61 remove_diacritics 2 tokenchars '._-@'"
 );
 """
 
@@ -61,8 +68,19 @@ def init_db(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(str(db_path))
     try:
-        con.executescript(SCHEMA)
+        try:
+            con.executescript(SCHEMA)
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if "tokenize" in msg and "parse error" in msg:
+                # Fallback: create FTS without custom tokenizer options
+                fallback = SCHEMA.replace(
+                    "tokenize = \"unicode61 remove_diacritics 2 tokenchars '._-@'\"",
+                    "tokenize = 'unicode61'",
+                )
+                con.executescript(fallback)
+            else:
+                raise
         con.commit()
     finally:
         con.close()
-

@@ -1,0 +1,4 @@
+.wayfinder
+__pycache__
+/data
+*.egg-info

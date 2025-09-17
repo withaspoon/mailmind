@@ -52,7 +52,14 @@ Data layout (default; configurable)
 
 Install (developer preview)
 1) Create and activate a Python 3.11 virtualenv
-   - macOS: `python3 -m venv .venv && source .venv/bin/activate`
+   - Any shell (no activation):
+     - `python3 -m venv .venv`
+     - `.venv/bin/python -m pip install -e .`
+     - Run commands via the venv binaries, e.g. `.venv/bin/mailmind --help`
+   - If you prefer activation:
+     - bash/zsh: `python3 -m venv .venv && source .venv/bin/activate`
+     - fish: `python3 -m venv .venv && source .venv/bin/activate.fish`
+     - tcsh/csh: `python3 -m venv .venv && source .venv/bin/activate.csh`
 2) Install core Python deps (to be defined once code is added)
    - Minimal set will include: click/typer, beautifulsoup4, lxml, pdfplumber, ocrmypdf, tesseract bindings, sentence-transformers, hnswlib, sqlite3 (builtin), watchdog
 3) Install system tools (OCR)
@@ -136,6 +143,7 @@ CLI (planned commands)
 - `mailmind init --root ./data` — create folders, DB, FTS tables
 - `mailmind sync` — run mbsync for configured accounts (optional helper)
 - `mailmind index --incremental` — parse new messages, attachments, OCR if needed, embed, build ANN
+- `mailmind index-mbox --mbox sample.mbox` — index an mbox file (added for development/testing)
 - `mailmind search "board meeting pdf totals since 2000"` — hybrid query with rerank and citations
 - `mailmind summarize --query "board meeting totals since 2000" --export summary.md` — plan + execute tools + summarization
 - `mailmind extract --attachments --type pdf --query "board meeting" --out ./exports/` — copy attachment originals and text to out
@@ -186,4 +194,3 @@ Roadmap snapshot (see TODO.md)
 
 Licensing notes
 - Gemma models are under the Gemma license; local private use is fine. You are responsible for complying with model licenses.
-
